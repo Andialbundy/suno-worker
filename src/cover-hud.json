@@ -1,0 +1,52 @@
+{
+  "artists": {
+    "BUNDIX": {
+      "style": "flow-gradient",
+      "accent": "#7df9ff",
+      "accent2": "#4dd0e1",
+      "brandColor": "#FFD700",
+      "titleGradient": ["#eafcff", "#9de6ff", "#6ec6ff"]
+    },
+    "ANDRAMON": {
+      "style": "psy-pulse",
+      "accent": "#c75bff",
+      "accent2": "#7a5bff",
+      "brandColor": "#FFD700",
+      "titleGradient": ["#ffffff", "#d88bff", "#a05bff"]
+    },
+    "ANDRAX": {
+      "style": "hardcore-edge",
+      "accent": "#ff5a3c",
+      "accent2": "#ff9d2e",
+      "brandColor": "#FFD700",
+      "titleGradient": ["#fff3e8", "#ff9d5a", "#ff4d3c"]
+    },
+    "DYBUN": {
+      "style": "acid-wire",
+      "accent": "#7dff5a",
+      "accent2": "#39e675",
+      "brandColor": "#FFD700",
+      "titleGradient": ["#f2ffea", "#b4ff8a", "#55e675"]
+    },
+    "AERYN": {
+      "style": "cosmic-ease",
+      "accent": "#b39dff",
+      "accent2": "#7d8bff",
+      "brandColor": "#FFD700",
+      "titleGradient": ["#ffffff", "#c7b3ff", "#8d7bff"]
+    },
+    "NALDIX": {
+      "style": "deepflow",
+      "accent": "#ffd166",
+      "accent2": "#ff9e4d",
+      "brandColor": "#FFD700",
+      "titleGradient": ["#fff8e6", "#ffd97a", "#ffa055"]
+    }
+  },
+  "fonts": {
+    "display": "Orbitron",
+    "body": "Rajdhani"
+  },
+  "brand": "ANDRA NETWORK",
+  "brandSvg": "/tmp/opencode/brand/portal-a-symbol-negative.svg"
+}

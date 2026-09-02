@@ -1,0 +1,30 @@
+import { chromium } from 'playwright'
+import { readFileSync } from 'fs'
+const state = JSON.parse(readFileSync('/tmp/opencode/bandcamp/storage.json','utf8'))
+const browser = await chromium.launch({ headless: true })
+const ctx = await browser.newContext()
+await ctx.addCookies(state.cookies)
+const page = await ctx.newPage()
+page.on('request', r => { if (r.method()==='POST'||r.method()==='PUT'||r.method()==='PATCH') console.log('REQ', r.method(), r.url().slice(0,100)) })
+page.on('response', r => { if (r.request().method()==='POST'||r.request().method()==='PUT'||r.request().method()==='PATCH') console.log('RESP', r.status(), r.url().slice(0,100)) })
+page.on('console', m => console.log('CONSOLE['+m.type()+']', JSON.stringify(m.args().map(a=>a.toString().slice(0,300)))))
+await page.goto('https://andra-network.bandcamp.com/edit_album', { waitUntil: 'domcontentloaded' })
+await page.locator('input.title.required').fill('SAVE PROBE')
+await page.locator('ol.tracks li.add-audio input[type=file]').first().setInputFiles('/tmp/opencode/bc-masters/GH_EXT.flac')
+for (let k=0;k<30;k++){
+  await page.waitForTimeout(5000)
+  const cls = await page.locator('ol.tracks li.track').first().getAttribute('class').catch(()=>'')
+  if (cls.includes('has-audio')) { console.log('audio done'); break }
+}
+await page.evaluate(() => { const inp = document.querySelector('ol.tracks li.track input[name^="track.title_"]'); if (inp) { inp.value='Glass Halo Drift (Extended)'; inp.dispatchEvent(new Event('input',{bubbles:true})) } })
+const saveHtml = await page.locator('a.save-draft').first().evaluate(el => ({ tag: el.tagName, cls: el.className, href: el.getAttribute('href'), html: el.outerHTML.slice(0,300) })).catch(e=>({err:e.message.slice(0,100)}))
+console.log('save-draft el:', JSON.stringify(saveHtml))
+const forms = await page.evaluate(() => Array.from(document.forms).map(f => ({ id: f.id, action: f.action, method: f.method, name: f.name })))
+console.log('forms:', JSON.stringify(forms))
+const btns = await page.evaluate(() => Array.from(document.querySelectorAll('form button, form input[type=submit], .edit_album a, .edit_album button')).map(b => b.tagName+'.'+b.className+' text='+(b.textContent||'').trim().slice(0,30)).slice(0,30))
+console.log('buttons/links:', JSON.stringify(btns))
+await page.locator('a.save-draft').first().click().catch(async () => { await page.evaluate(() => document.querySelector('a.save-draft')?.click()) })
+console.log('--- clicked, waiting 15s ---')
+await page.waitForTimeout(15000)
+console.log('URL after save:', page.url())
+await browser.close()
