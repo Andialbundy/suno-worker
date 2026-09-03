@@ -35,17 +35,41 @@ function isValidMedia(buf) {
   return (byte1 & 0xe0) === 0xe0 && (byte1 & 0x06) !== 0
 }
 
-export async function genCover(prompt, { artist, title, model = FLUX_SCHNELL } = {}, deps = {}) {
-  const gen = deps.generate ?? generateCover
-  const base = await gen(process.env.REPLICATE_API_TOKEN, { model, prompt })
-  if (!artist || !title) return base
+async function writeBaseAndOverlay({ base, artist, title }) {
   const dir = tmpdir()
   const basePath = join(dir, `cov-${randomUUID()}.png`)
   const outPath = join(dir, `cov-out-${randomUUID()}.png`)
   writeFileSync(basePath, base)
   try {
     await renderHudCover({ baseImg: basePath, artist, title, out: outPath })
+    return { base: basePath, cover: outPath }
+  } catch (e) {
+    rmSync(basePath, { force: true })
+    rmSync(outPath, { force: true })
+    throw e
+  }
+}
+
+export async function genCover(prompt, { artist, title, model = FLUX_SCHNELL } = {}, deps = {}) {
+  const gen = deps.generate ?? generateCover
+  const base = await gen(process.env.REPLICATE_API_TOKEN, { model, prompt })
+  if (!artist || !title) return base
+  const { base: basePath, cover: outPath } = await writeBaseAndOverlay({ base, artist, title })
+  try {
     return readFileSync(outPath)
+  } finally {
+    rmSync(basePath, { force: true })
+    rmSync(outPath, { force: true })
+  }
+}
+
+export async function genBaseAndCover(prompt, { artist, title, model = FLUX_SCHNELL } = {}, deps = {}) {
+  const gen = deps.generate ?? generateCover
+  const base = await gen(process.env.REPLICATE_API_TOKEN, { model, prompt })
+  if (!artist || !title) return { base, cover: base }
+  const { base: basePath, cover: outPath } = await writeBaseAndOverlay({ base, artist, title })
+  try {
+    return { base, cover: readFileSync(outPath) }
   } finally {
     rmSync(basePath, { force: true })
     rmSync(outPath, { force: true })
@@ -73,8 +97,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       const copyright = `© ${new Date().getFullYear()} Andra Network / ${artist.name}`
       const template = artist?.image_prompt_template
       const finalPrompt = composePrompt(template, { image_prompt: job.image_prompt, mood: job.mood, title: job.title })
-      const coverBuf = await genCover(finalPrompt, { artist: artist?.name, title: job.title })
+      const { base: baseCover, cover: coverBuf } = await genBaseAndCover(finalPrompt, { artist: artist?.name, title: job.title })
       const cover_url = await uploadBucket('tracks', `covers/${trackId}.png`, coverBuf, 'image/png')
+      const cover_base_url = await uploadBucket('tracks', `covers/${trackId}_base.png`, baseCover, 'image/png')
       spend = recordSpend(spend, { model: FLUX_SCHNELL, cost: COST_PER_MODEL[FLUX_SCHNELL], trackTitle: job.title, predictionId: job.id })
       saveSpend(spend)
       if (shouldAlert(spend)) {
@@ -95,6 +120,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         title: job.title,
         audio_url,
         cover_url,
+        cover_base_url,
         video_url: null,
         version,
         generation_prompt: job.prompt,

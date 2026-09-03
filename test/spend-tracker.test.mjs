@@ -15,11 +15,17 @@ test('threholds', () => {
 })
 
 test('recordSpend accumulates total and remaining', () => {
-  let s = recordSpend(loadSpend(), { model: 'flux-schnell', cost: 0.003, trackTitle: 'A', predictionId: 'p' })
-  s = recordSpend(s, { model: 'flux-schnell', cost: 0.003, trackTitle: 'B', predictionId: 'q' })
-  assert.equal(s.total_usd, 0.006)
-  assert.equal(remainingUsd(s), 9.994)
-  assert.equal(s.predictions.length, 2)
+  const dir = mkdtempSync(join(tmpdir(), 'spend-'))
+  const file = join(dir, 'ledger.json')
+  try {
+    let s = recordSpend(loadSpend(file), { model: 'flux-schnell', cost: 0.003, trackTitle: 'A', predictionId: 'p' })
+    s = recordSpend(s, { model: 'flux-schnell', cost: 0.003, trackTitle: 'B', predictionId: 'q' })
+    assert.equal(s.total_usd, 0.006)
+    assert.equal(remainingUsd(s), 9.994)
+    assert.equal(s.predictions.length, 2)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('shouldAlert triggers only once crossing $9 and only before markAlerted', () => {

@@ -1,6 +1,6 @@
 // src/regen-covers.mjs
 import { composePrompt } from './cover-prompt.mjs'
-import { genCover } from './finalize-gp.mjs'
+import { genBaseAndCover } from './finalize-gp.mjs'
 import { loadSpend, recordSpend, saveSpend, shouldAlert, markAlerted, remainingUsd } from './spend-tracker.mjs'
 import { COST_PER_MODEL, FLUX_SCHNELL, FLUX_PRO } from './replicate.mjs'
 
@@ -37,9 +37,10 @@ export async function regenAll(sb, { model, pilot = false, pilotSeed }) {
       const cost = COST_PER_MODEL[model]
       if (!budgetSafe(spend, cost)) { console.log('BUDGET STOP at', remainingUsd(spend)); break }
       const prompt = composePrompt(track.artist.image_prompt_template, { image_prompt: track.image_prompt, mood: track.mood, title: track.title })
-      const buf = await genCover(prompt, { artist: track.artist.name, title: track.title, model })
-      const url = await uploadBucket(sb, track.id, buf)   // helper below
-      await sb.from('tracks').update({ cover_url: url }).eq('id', track.id)
+      const { base, cover } = await genBaseAndCover(prompt, { artist: track.artist.name, title: track.title, model })
+      const url = await uploadBucket(sb, track.id, cover)   // helper below
+      const baseUrl = await uploadBucket(sb, `${track.id}_base`, base)
+      await sb.from('tracks').update({ cover_url: url, cover_base_url: baseUrl }).eq('id', track.id)
       spend = recordSpend(spend, { model, cost, trackTitle: track.title })
       updated.push(track.title)
       if (shouldAlert(spend)) { console.log('ALERT $9 reached'); spend = markAlerted(spend) }

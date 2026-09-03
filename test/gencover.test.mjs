@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { genCover } from '../src/finalize-gp.mjs'
+import { genCover, genBaseAndCover } from '../src/finalize-gp.mjs'
 
 test('genCover returns raw replicate output (no HUD) when artist/title omitted', async () => {
   const fake = Buffer.from([0x89, 0x50, 0x4e, 0x47])
@@ -24,4 +24,12 @@ test('genCover throws propagate from generate', async () => {
     genCover('x', {}, { generate: async () => { throw new Error('REPLICATE_API_TOKEN missing') } }),
     /missing/
   )
+})
+
+test('genBaseAndCover returns {base, cover} where base is raw (no artist/title => both are raw)', async () => {
+  const fake = Buffer.from([0x89, 0x50, 0x4e, 0x47])
+  const gen = async () => fake
+  const { base, cover } = await genBaseAndCover('prompt', {}, { generate: gen })
+  assert.deepEqual(base, fake)
+  assert.deepEqual(cover, fake)
 })
