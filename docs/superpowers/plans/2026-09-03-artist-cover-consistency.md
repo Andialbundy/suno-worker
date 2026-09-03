@@ -873,6 +873,15 @@ Verify batch completeness and cleanliness:
 
 Append the rollout result (count regenerated, final spend) to `docs/superpowers/plans/2026-09-03-artist-cover-consistency.md` and update the `suno-worker-state` memory block's REPLICATE COVER GEN section with the final spend figure and any model used. Commit any doc/memory-driven code notes if applicable (memory itself is not committed).
 
+### Rollout result — EXECUTED 2026-09-03 (diverged from plan)
+Pilot ran as specified: `--pilot` regenerated exactly 6 (one per `PILOT_SEED`) at $0.018, verified clean (OCR + brightness). User then redefined scope mid-run:
+- **Preserve** the 24 `.png` covers already produced by this Replicate+HD pipeline (incl. the 6 pilot).
+- **Regenerate** the Suno-imported covers that came **after** the "Cinder Grid Groove" marker — the chain from **Fading Halo** onward (20 tracks, all `.jpg`). Kept Cinder Grid Groove and everything before it as the last good covers.
+- Result: 20 targeted tracks regenerated via `genCover` (flux-schnell base + HUD), uploaded as `covers/<id>.png`, `cover_url` updated. OCR + brightness spot-check on 5 samples clean; all 20 now `.png`.
+- Total ledger spend: **$0.078** (6 pilot + 20 batch), `usd_left` **$9.922**, flux-schnell, no budget alert.
+- DB coverage after batch: **44 `.png` / 192 `.jpg` / 1 `.webp`**. The single remaining `.webp` is **Deep Space Air** (pre-Cinder, garbled AI cover) — left as-is per "preserve already-generated" instruction; flagged for a possible future regen.
+- Ad-hoc runner used `scratch/regen-20.mjs` (deleted after run); no repo code change committed (HEAD unchanged at `d53ccd4`).
+
 ---
 
 ## Self-Review
