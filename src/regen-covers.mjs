@@ -32,18 +32,21 @@ export async function regenAll(sb, { model, pilot = false, pilotSeed }) {
   const rows = await selectOfficialTracks(sb, { pilot, pilotSeed })
   let spend = loadSpend()
   let updated = []
-  for (const track of rows) {
-    const cost = COST_PER_MODEL[model]
-    if (!budgetSafe(spend, cost)) { console.log('BUDGET STOP at', remainingUsd(spend)); break }
-    const prompt = composePrompt(track.artist.image_prompt_template, { image_prompt: track.image_prompt, mood: track.mood, title: track.title })
-    const buf = await genCover(prompt, { artist: track.artist.name, title: track.title, model })
-    const url = await uploadBucket(sb, track.id, buf)   // helper below
-    await sb.from('tracks').update({ cover_url: url }).eq('id', track.id)
-    spend = recordSpend(spend, { model, cost, trackTitle: track.title })
-    updated.push(track.title)
-    if (shouldAlert(spend)) { console.log('ALERT $9 reached'); spend = markAlerted(spend) }
+  try {
+    for (const track of rows) {
+      const cost = COST_PER_MODEL[model]
+      if (!budgetSafe(spend, cost)) { console.log('BUDGET STOP at', remainingUsd(spend)); break }
+      const prompt = composePrompt(track.artist.image_prompt_template, { image_prompt: track.image_prompt, mood: track.mood, title: track.title })
+      const buf = await genCover(prompt, { artist: track.artist.name, title: track.title, model })
+      const url = await uploadBucket(sb, track.id, buf)   // helper below
+      await sb.from('tracks').update({ cover_url: url }).eq('id', track.id)
+      spend = recordSpend(spend, { model, cost, trackTitle: track.title })
+      updated.push(track.title)
+      if (shouldAlert(spend)) { console.log('ALERT $9 reached'); spend = markAlerted(spend) }
+    }
+  } finally {
+    saveSpend(spend)
   }
-  saveSpend(spend)
   return updated
 }
 
