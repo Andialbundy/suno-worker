@@ -61,19 +61,19 @@ function buildHtml({ baseImg, artist, title }) {
   .badgebar { display:flex; align-items:center; gap:16px; }
   .segline { display:flex; gap:6px; }
   .segline i { width:26px; height:6px; background:${gl(artistCfg.accent)}0.9); box-shadow:0 0 6px ${gl(artistCfg.accent)}0.8)); }
-  /* title block */
-  .titwrap { position:absolute; left:52px; right:52px; bottom:104px; text-align:left; }
-  .rule { width:120px; height:3px; background:linear-gradient(90deg,${artistCfg.accent},${artistCfg.accent2}); margin-bottom:22px;
+  /* title block: bottom-left, at logo height, never touching logo */
+  .titwrap { position:absolute; left:52px; right:220px; bottom:60px; text-align:left; }
+  .rule { width:120px; height:3px; margin:0 0 18px; background:linear-gradient(90deg,${artistCfg.accent},${artistCfg.accent2});
     box-shadow:0 0 10px ${gl(artistCfg.accent)}0.6)); }
   .title { font-family:'${display}',sans-serif; font-weight:900; font-size:72px; line-height:0.98;
     background:linear-gradient(180deg, ${tg});
     -webkit-background-clip:text; background-clip:text; color:transparent;
     filter:drop-shadow(0 0 22px ${gl(artistCfg.accent)}0.35)); text-transform:uppercase; }
-  /* brand logo: symbol only, bottom-right */
-  .logo { position:absolute; right:44px; bottom:40px; width:120px; height:auto; opacity:0.95;
-    filter:drop-shadow(0 0 12px ${gl(artistCfg.accent)}0.3)); }
-  .logo svg { width:120px; height:auto; }
-</style></head><body>
+  /* brand logo: symbol only, bottom-right, watermark style */
+  .logo { position:absolute; right:48px; bottom:44px; width:88px; height:auto; opacity:0.35;
+    filter:drop-shadow(0 0 6px ${gl(artistCfg.accent)}0.25)); }
+  .logo svg { width:88px; height:auto; }
+  </style></head><body>
   <img class="base" src="file://${baseImg}"/>
   <div class="vig"></div>
   <div class="frame">
@@ -95,6 +95,34 @@ function buildHtml({ baseImg, artist, title }) {
     <div class="title">${title}</div>
   </div>
   ${brandSvg ? `<div class="logo">${brandSvg}</div>` : ''}
+  <script>
+    document.fonts.ready.then(()=>{
+      const title=document.querySelector('.title'), logo=document.querySelector('.logo');
+      const total=SIZE;
+      if(!title||!logo){ if(title&&!logo) title.style.fontSize='72px'; return; }
+      const clearance=logo.getBoundingClientRect().left - 80;  // gap so title never touches logo
+      const maxWidth=clearance - 52;  // preserve left padding
+      const probe=title.cloneNode(true);
+      probe.style.position='absolute'; probe.style.left='-9999px'; probe.style.top='-9999px';
+      probe.style.removeProperty('background'); probe.style.webkitBackgroundClip='padding-box';
+      document.body.appendChild(probe);
+      let fs=72;
+      probe.style.fontSize='72px'; probe.style.whiteSpace='nowrap';
+      if (probe.getBoundingClientRect().width > maxWidth) {
+        probe.style.whiteSpace='normal'; probe.style.width=maxWidth+'px';
+        while (true) {
+          probe.style.fontSize=fs+'px';
+          const lineH=fs*0.98;
+          const h=probe.getBoundingClientRect().height;
+          const lines=Math.round(h/lineH);
+          if (lines<=3 || fs<=12) break;
+          fs-=2;
+        }
+        title.style.fontSize=fs+'px';
+      }
+      probe.remove();
+    });
+  </script>
 </body></html>`
 }
 
