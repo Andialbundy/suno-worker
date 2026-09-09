@@ -1,9 +1,9 @@
 #!/bin/bash
-# Fix: CHROME_PROFILE env var name → CHROME_PROFILE_DIR in systemd service
-# Run this on neuralnode: ssh <user>@<neuralnode> then bash fix-neural-sunodeploy.sh
+# Fix: Update suno-worker.service on neuralnode with CHROME_PROFILE_DIR
+# Run via SSH or directly on neuralnode
 
 echo "Updating suno-worker.service..."
-cat > /etc/systemd/system/suno-worker.service << 'SERVICE'
+sudo bash -c 'cat > /etc/systemd/system/suno-worker.service << SERVICE
 [Unit]
 Description=Suno worker job poll
 After=docker.service
@@ -16,10 +16,10 @@ ExecStart=/usr/bin/docker run --rm --env-file /home/crd-remote/suno-worker/.env 
   -e CHROME_PROFILE_DIR=/root/chrome-profile \
   -v /home/crd-remote/suno-chrome-profile:/root/chrome-profile \
   suno-worker:chrome
-SERVICE
+SERVICE'
 
 echo "Reloading systemd..."
-systemctl daemon-reload
-systemctl restart suno-worker.timer
-systemctl status suno-worker.timer --no-pager
+sudo systemctl daemon-reload
+sudo systemctl restart suno-worker.timer
+sudo systemctl status suno-worker.timer --no-pager
 echo "Done. Timer should now use correct profile path."
