@@ -300,6 +300,7 @@ async function generateSong(prompt, style, jobId, title) {
 const page = browser.pages()[0] || await browser.newPage()
   page.on('console', m => { if (/\[TB\]|turnstile|captcha|600010/i.test(m.text())) console.log('[PAGE]', m.text().slice(0, 150)) })
   let clipId = null
+  let flacUrl = null
   let audioUrl = null
   let audioDownloadUrl = null
   let domDataAtClose = null
