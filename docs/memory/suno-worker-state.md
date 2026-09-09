@@ -9,6 +9,14 @@ FLAC-AUTOMATIK (bounded, 2026-09-08 implementiert):
 - TESTS: test/harvest-flac.test.mjs (6 tests: computeTrim boundary, transcodeToFlac FLAC-magic+dur~3s, fallbackMp3ToFlac, harvestSegments Buffer, MERGE_SCRIPT). 28/28 alle tests bestanden. node --check bestanden.
 - E2E-Hinweis: Suno liefert nicht alle Songs via MSE-Streaming (0b678f65 → segs:0, Direkt-URL). Modul via Unit-Tests + frühere Session bewiesen. Fallback MP3->FLAC funktioniert immer.
 
+PRODUKTIV-DEPLOY (2026-09-08):
+- Dockerfile neu: Ubuntu 22.04 + bun + Chrome + Xvfb + python3/build-essential (better-sqlite3)
+- Image: suno-worker:chrome (1c7781b79207) gebaut aus /home/crd-remote/suno-worker
+- systemd service: /etc/systemd/system/suno-worker.service → Env /home/crd-remote/suno-worker/.env, Chrome profile volume /home/crd-remote/suno-chrome-profile
+- Timer: suno-worker.timer ENABLED + ACTIVE (alle 5 min, OnBootSec=2min)
+- Verifikation: Test-Job claimed→processing, Generation läuft (5-min Poll). Nächster Vercel Cron 10:00 UTC erzeugt Jobs → Worker verarbeitet.
+- ALTER Worker auf /home/andialbundy/suno-worker (820 Zeilen, KEIN Harvest/FLAC) ersetzt.
+
 PLAYWRIGHT-PITFALLS: page.evaluate darf nur 1 Arg; addInitScript VOR goto; .v-input__slot für Vuetify-Checkboxen; native setter für Inputs.
 
 TOOLAST: Release 1693993 (Neon Orbit Rite, NALDIX) eingereicht. Duplikat 1685728 Support-Ticket gesendet (help@toolost.com). 5 Releases in_review (1685735,1686470,1686471,1686473,1686475).

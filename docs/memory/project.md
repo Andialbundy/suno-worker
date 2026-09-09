@@ -12,7 +12,9 @@ LLMS.TXT: src/app/llms.txt/route.ts — dynamische Route, liest artists + publis
 
 VERCEL: N8N_RELEASE_WEBHOOK_URL + SECRET + DISCORD_RELEASE_WEBHOOK_URL in Prod. Auto-deploy auf main-Push.
 
-TOOLOST (09-05): 5 Releases in_review: NEON PULSE PROTOCOL=1685735, AURORA=1686470, CRYSTAL=1686471, UPLIFTING=1686473, METALLIC=1686475 (09-12). Artists: BUNDIX=259038 ANDRAMON=259039 ANDRAX=259040 DYBUN=259041 AERYN=259042 NALDIX=259043; Label 20755. NEU 09-07: Release 1693993 EINGEREICHT (NALDIX 'Neon Orbit Rite', Single, in Ausstehend, 09-22, No lyrics). Duplikat 1685728: Support-Ticket gesendet (2026-09-07, Technical Issues via toolost.com/support/message, '1685728 loeschen'). Supabase 72317dcc id=1693993.
+TOOLOST (09-05): 5 Releases in_review: NEON=1685735, AURORA=1686470, CRYSTAL=1686471, UPLIFTING=1686473, METALLIC=1686475 (09-12). Artists: BUNDIX=259038 ANDRAMON=259039 ANDRAX=259040 DYBUN=259041 AERYN=259042 NALDIX=259043; Label 20755. NEU 09-07: Release 1693993 EINGEREICHT (NALDIX 'Neon Orbit Rite', Single, Ausstehend, 09-22, No lyrics). Duplikat 1685728: Support-Ticket gesendet (09-07, '1685728 loeschen'). Supabase 72317dcc id=1693993.
+
+SUNO WORKER DEPLOY (09-08): systemd Timer aktiv (alle 5 min), Docker Image suno-worker:chrome (1c7781b79207) mit FLAC-Harvest Code produktiv. Nächster Vercel Cron 10:00 UTC → Jobs werden verarbeitet.
 
 OFFEN: Vercel-Secrets, Bandcamp Lizenz, service role key, Gewerbeanmeldung Uster.
 
