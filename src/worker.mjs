@@ -645,18 +645,26 @@ const page = browser.pages()[0] || await browser.newPage()
     // in this browser profile (has drifted to v3.5 before). Must run after
     // Advanced mode is confirmed active, not before — the dropdown isn't
     // rendered yet on initial page load.
+    // v6 available via session flag 'voices-v6'.
     try {
-      const modelBtn = await page.$('button:has-text("v5.5"), button:has-text("v5"), button:has-text("v4"), button:has-text("v3.5")')
+      const modelBtn = await page.$('button:has-text("v5.5"), button:has-text("v5"), button:has-text("v6"), button:has-text("v4"), button:has-text("v3.5")')
       if (modelBtn) {
         await modelBtn.click()
         await page.waitForTimeout(500)
-        const v55 = await page.$('[role="menuitemradio"]:has-text("v5.5")')
-        if (v55) {
-          await v55.click()
-          console.log('Model set to v5.5')
+        // Prefer v6 if available, else fall back to v5.5
+        const v6 = await page.$('[role="menuitemradio"]:has-text("v6"), [role="menuitemradio"]:has-text("v6.0")')
+        if (v6) {
+          await v6.click()
+          console.log('Model set to v6')
         } else {
-          console.warn('⚠️  v5.5 menu item not found — closing dropdown')
-          await page.keyboard.press('Escape')
+          const v55 = await page.$('[role="menuitemradio"]:has-text("v5.5")')
+          if (v55) {
+            await v55.click()
+            console.log('Model set to v5.5')
+          } else {
+            console.warn('⚠️  v5.5/v6 menu item not found — closing dropdown')
+            await page.keyboard.press('Escape')
+          }
         }
       } else {
         console.warn('⚠️  Model version dropdown button not found')
