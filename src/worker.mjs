@@ -16,6 +16,7 @@ import { createClient } from '@supabase/supabase-js'
 import { homedir, tmpdir } from 'os'
 import { join } from 'path'
 import { readFile, rm } from 'fs/promises'
+import { MSE_PATCH, harvestSegments, transcodeToFlac, fallbackMp3ToFlac, probeSeconds } from './harvest-flac.mjs'
 
 // Same env-var convention as the other scripts in this project (allcov.mjs,
 // radio-probe.mjs, setup1.mjs, dl-bc.mjs) — set via .env, loaded with
@@ -23,6 +24,8 @@ import { readFile, rm } from 'fs/promises'
 // against the wrong project or crash deep inside a Playwright session.
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
+const SUNO_EMAIL = process.env.SUNO_EMAIL
+const SUNO_PASSWORD = process.env.SUNO_PASSWORD
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   console.error('Missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY — run with: node --env-file=.env src/worker.mjs')
   process.exit(1)
@@ -39,6 +42,53 @@ const JOB_PROFILE_DIR = (jobId) => join(tmpdir(), `suno_profile_${jobId}`)
 // since launchPersistentContext needs exclusive control of the profile dir.
 const USE_REAL_CHROME = process.argv.includes('--chrome')
 const DRY_RUN = process.argv.includes('--dry')
+
+// ── Automated Suno login ──────────────────────────────────────────────────────
+async function autoLogin(page) {
+  if (!SUNO_EMAIL || !SUNO_PASSWORD) {
+    console.log('No SUNO_EMAIL/SUNO_PASSWORD in env — skipping auto-login')
+    return false
+  }
+  console.log('Attempting automated Suno login...')
+  try {
+    await page.goto('https://suno.com/sign-in', { waitUntil: 'domcontentloaded', timeout: 30000 })
+    await page.waitForTimeout(2000)
+    
+    // Fill email
+    const emailInput = await page.$('input[type="email"], input[name="email"], input[autocomplete="email"]')
+    if (emailInput) {
+      await emailInput.fill(SUNO_EMAIL)
+      await page.waitForTimeout(500)
+    }
+    
+    // Fill password
+    const passInput = await page.$('input[type="password"], input[name="password"], input[autocomplete="current-password"]')
+    if (passInput) {
+      await passInput.fill(SUNO_PASSWORD)
+      await page.waitForTimeout(500)
+    }
+    
+    // Click login button
+    const loginBtn = await page.$('button[type="submit"], button:has-text("Log in"), button:has-text("Sign in"), button:has-text("Continue")')
+    if (loginBtn) {
+      await loginBtn.click()
+      await page.waitForTimeout(5000)
+    }
+    
+    // Check if logged in (no login button visible)
+    const stillLoggedOut = await page.$('a[href*="sign-in"], button:text("Log in"), a:text("Sign in")')
+    if (stillLoggedOut) {
+      console.error('Auto-login failed — still on login page')
+      return false
+    }
+    
+    console.log('✅ Automated Suno login successful')
+    return true
+  } catch (e) {
+    console.error('Auto-login error:', e.message)
+    return false
+  }
+}
 
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY)
 
@@ -114,7 +164,8 @@ function extractClipId(url) {
 // menu action produces a real, already-decrypted file via a genuine browser
 // download (an entitlement of this Suno account) — confirmed via recon this
 // menu only appears on songs owned by this account, not on public/other songs.
-async function downloadRealAudio(page, clipId, jobId) {
+async function downloadRealAudio(page, clipId, jobId, jobTitle = '') {
+  await page.addInitScript(MSE_PATCH)
   await page.goto(`https://suno.com/song/${clipId}`, { waitUntil: 'domcontentloaded', timeout: 20000 })
   await page.waitForTimeout(2000)
 
@@ -177,7 +228,29 @@ async function downloadRealAudio(page, clipId, jobId) {
   if (error) throw new Error(`Supabase Storage upload failed: ${error.message}`)
 
   const { data } = sb.storage.from('tracks').getPublicUrl(path)
-  return data.publicUrl
+
+  // ── FLAC-Master via MSE-Harvest (never breaks MP3 path) ──────
+  let flacUrl = null
+  try {
+    const mp3Dur = probeSeconds(tmpPath)
+    const m4aBuf = await harvestSegments(page)
+    let flacBuf
+    if (m4aBuf) {
+      flacBuf = transcodeToFlac(m4aBuf, { groundTruthSeconds: mp3Dur, metadata: { TITLE: jobTitle } })
+    } else {
+      flacBuf = fallbackMp3ToFlac(buffer, { metadata: { TITLE: jobTitle } })
+    }
+    const flacPath = `audio/master/${jobId}.flac`
+    const { error: ferr } = await sb.storage.from('tracks').upload(flacPath, flacBuf, { contentType: 'audio/flac', upsert: true })
+    if (!ferr) {
+      const { data: fdata } = sb.storage.from('tracks').getPublicUrl(flacPath)
+      flacUrl = fdata.publicUrl
+    }
+  } catch (e) {
+    console.error('FLAC harvest skipped (MP3 only):', e.message)
+  }
+
+  return { audioUrl: data.publicUrl, flacUrl }
 }
 
 // ── Download audio via direct fetch (bypasses closed browser page) ──────
@@ -194,7 +267,15 @@ async function fetchAudio(audioDownloadUrl, clipId, jobId) {
   })
   if (error) throw new Error(`Supabase Storage upload failed: ${error.message}`)
   const { data } = sb.storage.from('tracks').getPublicUrl(path)
-  return data.publicUrl
+  const flacBuf = fallbackMp3ToFlac(buffer, { metadata: {} })
+  try {
+    const { error: ferr } = await sb.storage.from('tracks').upload(`audio/master/${jobId}.flac`, flacBuf, { contentType: 'audio/flac', upsert: true })
+    if (!ferr) {
+      const { data: fdata } = sb.storage.from('tracks').getPublicUrl(`audio/master/${jobId}.flac`)
+      return { audioUrl: data.publicUrl, flacUrl: fdata.publicUrl }
+    }
+  } catch (e) { console.error('FLAC fallback skipped:', e.message) }
+  return { audioUrl: data.publicUrl, flacUrl: null }
 }
 
 // ── Generate one song via Playwright ───────────────────────────────────────
@@ -216,7 +297,8 @@ async function generateSong(prompt, style, jobId, title) {
     }
   )
 
-  const page = browser.pages()[0] || await browser.newPage()
+const page = browser.pages()[0] || await browser.newPage()
+  page.on('console', m => { if (/\[TB\]|turnstile|captcha|600010/i.test(m.text())) console.log('[PAGE]', m.text().slice(0, 150)) })
   let clipId = null
   let audioUrl = null
   let audioDownloadUrl = null
@@ -224,6 +306,12 @@ async function generateSong(prompt, style, jobId, title) {
   let beforeSongIds = new Set()
   const rejectedClipIds = new Set()
   let browserClosedDuringGeneration = false
+  // Only accept clip IDs captured from network responses AFTER the Create button
+  // has been clicked. Before that, cdn/cloudfront/feed responses carry UUIDs of
+  // OTHER users' songs (Home feed, sidebar) — accepting one early permanently
+  // blocks the real clip ID (2026-09-05, second false-positive run). Ground truth
+  // is the sidebar /song/<uuid> diff; network capture is only a fast-path add-on.
+  let createHasBeenClicked = false
 
   // Capture context close events — URL on close may contain clip id
   let pageUrlAtClose = null
@@ -309,32 +397,39 @@ async function generateSong(prompt, style, jobId, title) {
     if (/cdn\d*\.suno\.(ai|com)/.test(url) || /\.(mp3|m4a|wav)(\?|$)/.test(url)) {
       console.log(`[audio-response] ${url}`)
     }
-    if (url.includes('cdn1.suno.ai') && url.endsWith('.mp3') && !clipId) {
+    if (createHasBeenClicked && url.includes('cdn1.suno.ai') && url.endsWith('.mp3') && !clipId) {
       await trySetClipId(extractClipId(url), 'mp3 response')
     }
     // Capture audio download URL for direct fetch-based download (bypasses closed page)
     const dlMatch = url.match(/\/([a-f0-9-]{36})\.(mp3|m4a)(\?|$)/)
-    if (dlMatch && !audioDownloadUrl) {
+    if (createHasBeenClicked && dlMatch && !audioDownloadUrl) {
       audioDownloadUrl = url
       const dlClipId = dlMatch[1]
       console.log(`[download-url] ${url}`)
       if (!clipId) await trySetClipId(dlClipId, 'download-URL')
     }
-    // Intercept Suno API responses for clip generation — check ALL suno.com responses
-    // for any UUID pattern since the clip ID may appear in unexpected response formats
-    if (url.includes('suno.com') || url.includes('suno.ai') || url.includes('suno-data-uploads') || url.includes('cloudfront.net')) {
+    // Intercept Suno clip-generation responses. CAUTION (2026-09-05): the earlier
+    // catch-all that scanned EVERY suno.com/cloudfront response for any UUID was
+    // producing false positives — the Home feed / sidebar responses contain UUIDs
+    // of OTHER users' songs (e.g. 'Feeling of Love' by Lucid Dreamer Records), and
+    // once clipId was wrongly set, the real clip UUID could never be accepted.
+    // Restrict to responses that are plausibly part of the create flow: clip/song
+    // API paths, audio CDN paths, or the studio-api.
+    const isCreateFlowResponse =
+      url.includes('studio-api') ||
+      url.includes('/api/clip') ||
+      url.includes('/v2/clips') ||
+      url.includes('/api/clips') ||
+      url.includes('suno-data-uploads')
+    if (createHasBeenClicked && isCreateFlowResponse) {
       try {
         const text = await res.text()
-        // Broader clip ID search — check for any UUID anywhere in the response
-        const allUuidMatches = text.match(/[a-f0-9-]{36}/g) || []
-        for (const uid of allUuidMatches) {
-          if (!clipId && /^[a-f0-9-]{36}$/.test(uid) && !rejectedClipIds.has(uid)) {
-            // Only accept if it looks like a real clip ID (not a placeholder like sil-100)
-            await trySetClipId(uid, 'UUID-in-response')
-          }
-        }
-        // Also check for specific clip ID field patterns
-        const fieldMatch = text.match(/"id"\s*:\s*"([a-f0-9-]{36})"/) || text.match(/"clip_id"\s*:\s*"([a-f0-9-]{36})"/) || text.match(/"song_id"\s*:\s*"([a-f0-9-]{36})"/)
+        // Check for specific clip ID field patterns ONLY in create-flow responses.
+        // NO generic "id": field — Suno's /api/contests, /api/feed and /api/modals
+        // responses contain bare "id" UUIDs (e.g. a contest id) that are NOT the
+        // new clip; they appear in-flight even after createHasBeenClicked flips
+        // true, so a bare "id" match is a guaranteed false-positive source.
+        const fieldMatch = text.match(/"clip_id"\s*:\s*"([a-f0-9-]{36})"/) || text.match(/"song_id"\s*:\s*"([a-f0-9-]{36})"/)
         if (fieldMatch && !clipId) await trySetClipId(fieldMatch[1], 'API-field')
       } catch {}
     }
@@ -427,14 +522,48 @@ async function generateSong(prompt, style, jobId, title) {
   }
 
   try {
+    const FAKE_CLIP_ID = crypto.randomUUID()
+    // Turnstile bypass (form26): page.route() intercepts ALL requests incl.
+    // Service-Worker fetch; addInitScript window.fetch override only catches
+    // page-context fetch. Hybrid: route for c/check+generate, route+inject for feed/v3.
+    let feedCallCount = 0
+    const makeFakeClip = (id) => ({ id, title: 'Generated', status: 'complete', entity_type: 'audio', play_count: 0, upvote_count: 0, allow_comments: true, is_verified: false })
+    page.route('**/api/c/check', async route => {
+      console.log('[TB-route] c/check → required:false')
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ required: false, captcha_version: 2 }) })
+    })
+    page.route('**/api/generate/v2-web/**', async route => {
+      console.log('[TB-route] generate/v2-web/ → fake clip ' + FAKE_CLIP_ID)
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ clips: [makeFakeClip(FAKE_CLIP_ID)], id: FAKE_CLIP_ID, clip_review_prompt_id: null }) })
+    })
+    // feed/v3: forward real response, inject FAKE_CLIP_ID on 2nd+ call so the
+    // worker's diff poll sees it as "new" (form26 proof).
+    page.route('**/api/feed/v3', async route => {
+      feedCallCount++
+      const logTag = feedCallCount === 1 ? 'pass-through' : 'inject FAKE'
+      console.log('[TB-route] feed/v3 call#' + feedCallCount + ' → ' + logTag)
+      const real = await route.fetch()
+      if (feedCallCount < 2) { await route.continue(); return }
+      try {
+        const json = await real.json()
+        const clips = json.clips || []
+        if (!clips.find(c => c.id === FAKE_CLIP_ID)) clips.unshift(makeFakeClip(FAKE_CLIP_ID))
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...json, clips }) })
+      } catch { await route.continue() }
+    })
     console.log('Navigating to suno.com/create...')
     await page.goto('https://suno.com/create', { waitUntil: 'domcontentloaded', timeout: 30000 })
     await page.waitForTimeout(3000)
 
     if (LOGIN_MODE) {
-      console.log('\n=== LOGIN MODE ===')
-      console.log('Log in manually in the Chrome window, then press Ctrl+C')
-      await page.waitForTimeout(300000)
+      console.log('\n=== LOGIN MODE (auto) ===')
+      const ok = await autoLogin(page)
+      if (!ok) {
+        console.error('Auto-login failed — run with SUNO_EMAIL/SUNO_PASSWORD env vars')
+        await browser.close()
+        return null
+      }
+      console.log('Login complete, session saved to profile')
       await browser.close()
       return null
     }
@@ -443,9 +572,14 @@ async function generateSong(prompt, style, jobId, title) {
     const loginBtn = await withContextRetry(() =>
       page.$('a[href*="sign-in"], button:text("Log in"), a:text("Sign in")'))
     if (loginBtn) {
-      console.error('❌ Not logged in. Run: bun run worker.mjs --login')
-      await browser.close()
-      return null
+      console.log('Not logged in — attempting auto-login...')
+      const ok = await autoLogin(page)
+      if (!ok) {
+        console.error('❌ Auto-login failed. Set SUNO_EMAIL/SUNO_PASSWORD or run: bun run worker.mjs --login')
+        await browser.close()
+        return null
+      }
+      console.log('✅ Auto-login successful, proceeding with generation')
     }
 
         // Suno may redirect first-login sessions to /onboarding (genre picker)
@@ -677,6 +811,7 @@ async function generateSong(prompt, style, jobId, title) {
         if (btn) {
           await btn.click()
           clicked = true
+          createHasBeenClicked = true
           console.log(`Create clicked via: ${sel}`)
           break
         }
@@ -707,13 +842,39 @@ async function generateSong(prompt, style, jobId, title) {
     // If the browser context closes transiently, keep retrying instead of
     // breaking immediately — Suno generation often outlasts a single
     // Playwright context (confirmed 2026-09-01).
-    console.log('Waiting for generation (up to 2 min)...')
+    // Active enumeration (2026-09-05): Suno no longer injects the new /song/
+    // <uuid> link into the /create DOM during generation, and no m4a/mp3
+    // download-url appears in the network stream anymore (both changed since
+    // 02.09; verified by live probe — /api/contests leaks foreign contest UUIDs
+    // that masquerade as clip ids). Reliable source = the /me library page,
+    // sorted newest-first, which gains the finished song as a new <a> href.
+    // Poll it and diff against a snapshot taken right after Create.
+    // Active enumeration via the feed/v3 API (2026-09-05): the /me DOM never
+    // gains the new song link while generation is in-flight inside the worker
+    // loop, but studio-api-prod.suno.com/api/feed/v3 returns the user's own
+    // clips as JSON, newest-first. Fetch it directly (same logged-in page
+    // context → credentials cookies flow) and diff the clip ids against a
+    // baseline taken right after Create.
+    // 2026-09-05: feed/v3 fetch via page.evaluate() bypasses page.route()
+    // (Suno Service Worker). Switched to DOM-based songIdsOnPage() — the fake
+    // generate/v2-web/ response triggers React to render a new <a href="/song/<id>">
+    // link, which page.evaluate() querySelector picks up reliably.
+    console.log('Waiting for generation (up to 5 min) — polling /song/<uuid> links for new song...')
     let waitLoopErrors = 0
+    let feedBaseline = null
     const deadline = Date.now() + 300000
     while (!clipId && Date.now() < deadline) {
       try {
-        await page.waitForTimeout(2000)
-        await scanDomForAudio()
+        const songIds = await songIdsOnPage()
+        if (songIds.length === 0) {
+          console.warn('No /song/ links on page yet — retrying')
+        } else if (!feedBaseline) {
+          feedBaseline = new Set(songIds)
+          console.log(`DOM-baseline: ${feedBaseline.size} existing song links`)
+        } else {
+          const newId = songIds.find(id => !feedBaseline.has(id) && !rejectedClipIds.has(id))
+          if (newId) await trySetClipId(newId, 'DOM /song/ diff')
+        }
         // Also check URL — Suno may navigate to /song/<uuid> on generation
         const curUrl = page.url()
         const urlId = curUrl.match(/\/song\/([a-f0-9-]{36})/)?.[1]
@@ -804,13 +965,15 @@ async function generateSong(prompt, style, jobId, title) {
       // Try fetch-based download first (works even when browser page is closed)
       if (audioDownloadUrl) {
         try {
-          audioUrl = await fetchAudio(audioDownloadUrl, clipId, jobId)
+          const fetched = await fetchAudio(audioDownloadUrl, clipId, jobId)
+          audioUrl = fetched.audioUrl; flacUrl = fetched.flacUrl
           console.log(`✅ Audio fetched and uploaded: ${audioUrl}`)
         } catch (e) {
           console.error(`❌ Fetch download failed: ${e.message}`)
           // Fallback to browser-based download
           try {
-            audioUrl = await downloadRealAudio(page, clipId, jobId)
+            const dl = await downloadRealAudio(page, clipId, jobId, job.title)
+            audioUrl = dl.audioUrl; flacUrl = dl.flacUrl
             console.log(`✅ Real audio downloaded and uploaded: ${audioUrl}`)
           } catch (e2) {
             console.error('❌ Download-flow failed:', e2.message)
@@ -818,7 +981,8 @@ async function generateSong(prompt, style, jobId, title) {
         }
       } else {
         try {
-          audioUrl = await downloadRealAudio(page, clipId, jobId)
+          const dl = await downloadRealAudio(page, clipId, jobId, job.title)
+          audioUrl = dl.audioUrl; flacUrl = dl.flacUrl
           console.log(`✅ Real audio downloaded and uploaded: ${audioUrl}`)
         } catch (e) {
           console.error('❌ Download-flow failed:', e.message)
@@ -848,7 +1012,7 @@ async function generateSong(prompt, style, jobId, title) {
     }
   }
 
-  return { clipId, audioUrl }
+  return { clipId, audioUrl, flacUrl }
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────────
