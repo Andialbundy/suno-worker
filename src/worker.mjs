@@ -15,8 +15,11 @@ import { chromium } from 'playwright'
 import { createClient } from '@supabase/supabase-js'
 import { homedir, tmpdir } from 'os'
 import { join } from 'path'
-import { readFile, rm } from 'fs/promises'
+import { readFile, rm, writeFile } from 'fs/promises'
 import { MSE_PATCH, harvestSegments, transcodeToFlac, fallbackMp3ToFlac, probeSeconds } from './harvest-flac.mjs'
+
+// QNAP FLAC master storage path (FLACs live ONLY on QNAP, not Supabase)
+const QNAP_FLAC_BASE = '/mnt/qnap-multimedia/Musik/andra.network'
 
 // Same env-var convention as the other scripts in this project (allcov.mjs,
 // radio-probe.mjs, setup1.mjs, dl-bc.mjs) — set via .env, loaded with
@@ -32,8 +35,11 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 }
 const PROFILE_DIR = join(homedir(), '.suno-profile')
 const CHROME_BIN = '/usr/bin/google-chrome'
-const CHROME_PROFILE = process.env.CHROME_PROFILE_DIR || join(homedir(), '.config/google-chrome')
+const CHROME_PROFILE = process.env.CHROME_PROFILE_DIR || PROFILE_DIR
 const LOGIN_MODE = process.argv.includes('--login')
+// Global crash prevention: don't crash on browser closure
+process.on('uncaughtException', (err) => { console.warn('Uncaught:', err.message); });
+process.on('unhandledRejection', (err) => { console.warn('Unhandled rejection:', err?.message); });
 // Unique temp profile per job to avoid launchPersistentContext profile locking
 // when multiple jobs run in the same worker process.
 const JOB_PROFILE_DIR = (jobId) => join(tmpdir(), `suno_profile_${jobId}`)
@@ -45,6 +51,17 @@ const DRY_RUN = process.argv.includes('--dry')
 
 // ── Automated Suno login ──────────────────────────────────────────────────────
 async function autoLogin(page) {
+  // Check if session is already valid (cookies present) — skip login if so
+  try {
+    await page.goto('https://suno.com/', { waitUntil: 'domcontentloaded', timeout: 10000 })
+    await page.waitForTimeout(1000)
+    const loginBtn = await page.$('a[href*="sign-in"], button:text("Log in"), a:text("Sign in")')
+    if (!loginBtn) {
+      console.log('Session already valid — skipping auto-login')
+      return true
+    }
+  } catch {}
+  
   if (!SUNO_EMAIL || !SUNO_PASSWORD) {
     console.log('No SUNO_EMAIL/SUNO_PASSWORD in env — skipping auto-login')
     return false
@@ -164,7 +181,7 @@ function extractClipId(url) {
 // menu action produces a real, already-decrypted file via a genuine browser
 // download (an entitlement of this Suno account) — confirmed via recon this
 // menu only appears on songs owned by this account, not on public/other songs.
-async function downloadRealAudio(page, clipId, jobId, jobTitle = '') {
+async function downloadRealAudio(page, clipId, jobId, jobTitle = '', artistName) {
   await page.addInitScript(MSE_PATCH)
   await page.goto(`https://suno.com/song/${clipId}`, { waitUntil: 'domcontentloaded', timeout: 20000 })
   await page.waitForTimeout(2000)
@@ -198,39 +215,47 @@ async function downloadRealAudio(page, clipId, jobId, jobTitle = '') {
     const srcs = await page.evaluate(() =>
       [...document.querySelectorAll('audio')].map(a => a.src).filter(Boolean))
     if (srcs.some(s => !s.includes('sil-100'))) { ready = true; break }
-    await page.waitForTimeout(3000)
+    await page.waitForTimeout(15000)
   }
   if (!ready) throw new Error('Song never left placeholder/generating state (6min wait)')
 
   const menuBtn = await page.$('button[aria-label="More menu contents"]')
   if (!menuBtn) throw new Error('More menu button not found on song page')
   await menuBtn.click()
-  await page.waitForTimeout(600)
+  await page.waitForTimeout(1000) // Wait for menu to open
 
-  const downloadItem = await page.getByText('Download', { exact: true })
-  await downloadItem.hover()
-  await page.waitForTimeout(600)
+  // Take debug screenshot to see menu state
+  const debugPath = join(tmpdir(), `debug_before_download_${jobId}.png`)
+  await page.screenshot({ path: debugPath })
+  console.log(`Saved debug screenshot: ${debugPath}`)
 
+  // Click MP3 Audio directly (no hover needed if menu is visible)
+  const mp3Option = await page.getByText('MP3 Audio', { exact: true })
+  if (!mp3Option) {
+    throw new Error('MP3 Audio option not found in menu')
+  }
+  
   const [download] = await Promise.all([
     page.waitForEvent('download', { timeout: 20000 }),
-    page.getByText('MP3 Audio', { exact: true }).click(),
+    mp3Option.click(),
   ])
 
   const tmpPath = join(tmpdir(), `suno_${jobId}.mp3`)
   await download.saveAs(tmpPath)
   const buffer = await readFile(tmpPath)
 
-  const path = `audio/raw/${jobId}.mp3`
-  const { error } = await sb.storage.from('tracks').upload(path, buffer, {
-    contentType: 'audio/mpeg',
+  // End-user format: WAV only (Supabase storage)
+  const wavPath = `audio/raw/${jobId}.wav`
+  const { error } = await sb.storage.from('tracks').upload(wavPath, buffer, {
+    contentType: 'audio/wav',
     upsert: true,
   })
   if (error) throw new Error(`Supabase Storage upload failed: ${error.message}`)
 
-  const { data } = sb.storage.from('tracks').getPublicUrl(path)
+  const { data } = sb.storage.from('tracks').getPublicUrl(wavPath)
 
-  // ── FLAC-Master via MSE-Harvest (never breaks MP3 path) ──────
-  let flacUrl = null
+  // FLAC-Master goes ONLY to QNAP (never Supabase)
+  let flacPath = null
   try {
     const mp3Dur = probeSeconds(tmpPath)
     const m4aBuf = await harvestSegments(page)
@@ -240,47 +265,49 @@ async function downloadRealAudio(page, clipId, jobId, jobTitle = '') {
     } else {
       flacBuf = fallbackMp3ToFlac(buffer, { metadata: { TITLE: jobTitle } })
     }
-    const flacPath = `audio/master/${jobId}.flac`
-    const { error: ferr } = await sb.storage.from('tracks').upload(flacPath, flacBuf, { contentType: 'audio/flac', upsert: true })
-    if (!ferr) {
-      const { data: fdata } = sb.storage.from('tracks').getPublicUrl(flacPath)
-      flacUrl = fdata.publicUrl
-    }
+    flacPath = join(QNAP_FLAC_BASE, artistName, 'flac', `flac_${jobId}.flac`)
+    await writeFile(flacPath, flacBuf)
+    console.log(`FLAC master written to QNAP: ${flacPath}`)
   } catch (e) {
-    console.error('FLAC harvest skipped (MP3 only):', e.message)
+    console.error('FLAC harvest skipped (WAV only):', e.message)
   }
 
-  return { audioUrl: data.publicUrl, flacUrl }
+return { audioUrl: data.publicUrl, flacPath }
 }
 
 // ── Download audio via direct fetch (bypasses closed browser page) ──────
 // Uses the audio download URL captured from the response interceptor.
 // This works even when the Playwright page has closed.
-async function fetchAudio(audioDownloadUrl, clipId, jobId) {
+async function fetchAudio(audioDownloadUrl, clipId, jobId, artistName) {
   const response = await fetch(audioDownloadUrl)
   if (!response.ok) throw new Error(`Fetch failed: ${response.status}`)
   const buffer = Buffer.from(await response.arrayBuffer())
-  const path = `audio/raw/${jobId}.mp3`
-  const { error } = await sb.storage.from('tracks').upload(path, buffer, {
-    contentType: 'audio/mpeg',
+  // End-user format: WAV only (Supabase storage)
+  const wavPath = `audio/raw/${jobId}.wav`
+  const { error } = await sb.storage.from('tracks').upload(wavPath, buffer, {
+    contentType: 'audio/wav',
     upsert: true,
   })
   if (error) throw new Error(`Supabase Storage upload failed: ${error.message}`)
-  const { data } = sb.storage.from('tracks').getPublicUrl(path)
-  const flacBuf = fallbackMp3ToFlac(buffer, { metadata: {} })
+  const { data } = sb.storage.from('tracks').getPublicUrl(wavPath)
+
+  // FLAC master goes ONLY to QNAP
+  let flacPath = null
   try {
-    const { error: ferr } = await sb.storage.from('tracks').upload(`audio/master/${jobId}.flac`, flacBuf, { contentType: 'audio/flac', upsert: true })
-    if (!ferr) {
-      const { data: fdata } = sb.storage.from('tracks').getPublicUrl(`audio/master/${jobId}.flac`)
-      return { audioUrl: data.publicUrl, flacUrl: fdata.publicUrl }
-    }
-  } catch (e) { console.error('FLAC fallback skipped:', e.message) }
-  return { audioUrl: data.publicUrl, flacUrl: null }
+    const flacBuf = fallbackMp3ToFlac(buffer, { metadata: {} })
+    flacPath = join(QNAP_FLAC_BASE, artistName, 'flac', `flac_${jobId}.flac`)
+    await writeFile(flacPath, flacBuf)
+    console.log(`FLAC master written to QNAP: ${flacPath}`)
+  } catch (e) {
+    console.error('FLAC fallback skipped:', e.message)
+  }
+
+  return { audioUrl: data.publicUrl, flacPath }
 }
 
 // ── Generate one song via Playwright ───────────────────────────────────────
 
-async function generateSong(prompt, style, jobId, title) {
+async function generateSong(prompt, style, jobId, title, artistName) {
   const launchOpts = USE_REAL_CHROME ? {
     executablePath: CHROME_BIN,
     channel: undefined,
@@ -290,7 +317,7 @@ async function generateSong(prompt, style, jobId, title) {
     USE_REAL_CHROME ? CHROME_PROFILE : JOB_PROFILE_DIR(jobId),
     {
       ...launchOpts,
-      headless: true,
+      headless: LOGIN_MODE ? false : true,
       args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--profile-directory=Default', '--disable-gpu', '--disable-setuid-sandbox', '--disable-extensions', '--no-zygote'],
       viewport: { width: 1280, height: 900 },
       acceptDownloads: true,
@@ -299,6 +326,8 @@ async function generateSong(prompt, style, jobId, title) {
 
 const page = browser.pages()[0] || await browser.newPage()
   page.on('console', m => { if (/\[TB\]|turnstile|captcha|600010/i.test(m.text())) console.log('[PAGE]', m.text().slice(0, 150)) })
+
+  try {
   let clipId = null
   let flacUrl = null
   let audioUrl = null
@@ -523,65 +552,52 @@ const page = browser.pages()[0] || await browser.newPage()
   }
 
   try {
-    const FAKE_CLIP_ID = crypto.randomUUID()
     // Turnstile bypass (form26): page.route() intercepts ALL requests incl.
     // Service-Worker fetch; addInitScript window.fetch override only catches
-    // page-context fetch. Hybrid: route for c/check+generate, route+inject for feed/v3.
-    let feedCallCount = 0
-    const makeFakeClip = (id) => ({ id, title: 'Generated', status: 'complete', entity_type: 'audio', play_count: 0, upvote_count: 0, allow_comments: true, is_verified: false })
+    // page-context fetch. Keep only c/check route to bypass turnstile.
     page.route('**/api/c/check', async route => {
       console.log('[TB-route] c/check → required:false')
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ required: false, captcha_version: 2 }) })
     })
-    page.route('**/api/generate/v2-web/**', async route => {
-      console.log('[TB-route] generate/v2-web/ → fake clip ' + FAKE_CLIP_ID)
-      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ clips: [makeFakeClip(FAKE_CLIP_ID)], id: FAKE_CLIP_ID, clip_review_prompt_id: null }) })
-    })
-    // feed/v3: forward real response, inject FAKE_CLIP_ID on 2nd+ call so the
-    // worker's diff poll sees it as "new" (form26 proof).
-    page.route('**/api/feed/v3', async route => {
-      feedCallCount++
-      const logTag = feedCallCount === 1 ? 'pass-through' : 'inject FAKE'
-      console.log('[TB-route] feed/v3 call#' + feedCallCount + ' → ' + logTag)
-      const real = await route.fetch()
-      if (feedCallCount < 2) { await route.continue(); return }
-      try {
-        const json = await real.json()
-        const clips = json.clips || []
-        if (!clips.find(c => c.id === FAKE_CLIP_ID)) clips.unshift(makeFakeClip(FAKE_CLIP_ID))
-        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...json, clips }) })
-      } catch { await route.continue() }
-    })
-    console.log('Navigating to suno.com/create...')
-    await page.goto('https://suno.com/create', { waitUntil: 'domcontentloaded', timeout: 30000 })
-    await page.waitForTimeout(3000)
+  } catch (e) {
+    console.warn(`Turnstile route setup failed: ${e.message}`)
+  }
+
+     console.log('Navigating to suno.com/create...')
+    if (LOGIN_MODE) {
+      console.log("Please log in to suno.com in the visible browser!");
+    }
+
+    console.log('Navigating to /create - please solve Turnstile in the visible browser!')
+    try {
+      await page.goto('https://suno.com/create', { waitUntil: 'domcontentloaded', timeout: 30000 })
+      await page.waitForTimeout(15000)
+    } catch (navErr) {
+      console.warn('Navigation to /create failed or browser closed:', navErr.message)
+      if (navErr.message.includes('Target page, context or browser has been closed')) {
+        console.log('Browser closed during Turnstile — waiting for manual resolution...')
+        await new Promise(r => setTimeout(r, 30000))
+        try { await browser.close() } catch {}
+      }
+    }
 
     if (LOGIN_MODE) {
-      console.log('\n=== LOGIN MODE (auto) ===')
-      const ok = await autoLogin(page)
-      if (!ok) {
-        console.error('Auto-login failed — run with SUNO_EMAIL/SUNO_PASSWORD env vars')
-        await browser.close()
-        return null
+      console.log('Waiting up to 5 min for Turnstile to be solved manually...')
+      const deadline = Date.now() + 300000
+      let turnstileSolved = false
+      while (Date.now() < deadline && !turnstileSolved) {
+        const curUrl = await page.url()
+        const songLinks = await page.$$eval('a[href*="/song/"]', els => els.length).catch(() => 0)
+        if (curUrl.includes('/create') && songLinks > 0) { turnstileSolved = true }
+        if (!curUrl.includes('/create')) { turnstileSolved = true }
+        await new Promise(r => setTimeout(r, 5000))
       }
-      console.log('Login complete, session saved to profile')
-      await browser.close()
-      return null
+      if (turnstileSolved) console.log('Turnstile solved or page loaded!')
+      else console.log('Turnstile NOT solved - using session anyway')
     }
 
-    // Check if logged in (no login button visible)
-    const loginBtn = await withContextRetry(() =>
-      page.$('a[href*="sign-in"], button:text("Log in"), a:text("Sign in")'))
-    if (loginBtn) {
-      console.log('Not logged in — attempting auto-login...')
-      const ok = await autoLogin(page)
-      if (!ok) {
-        console.error('❌ Auto-login failed. Set SUNO_EMAIL/SUNO_PASSWORD or run: bun run worker.mjs --login')
-        await browser.close()
-        return null
-      }
-      console.log('✅ Auto-login successful, proceeding with generation')
-    }
+    // Session valid — cookies already loaded, no re-login needed
+    console.log('Session already valid, proceeding with generation...')
 
         // Suno may redirect first-login sessions to /onboarding (genre picker)
     if (page.url().includes('/onboarding')) {
@@ -591,7 +607,7 @@ const page = browser.pages()[0] || await browser.newPage()
       } catch {}
       await page.waitForTimeout(2000)
       await page.goto('https://suno.com/create', { waitUntil: 'domcontentloaded', timeout: 30000 })
-      await page.waitForTimeout(3000)
+      await page.waitForTimeout(15000)
     }
 
     console.log(`Filling prompt: "${prompt.substring(0, 60)}..."`)
@@ -628,7 +644,7 @@ const page = browser.pages()[0] || await browser.newPage()
         // clicking hasn't worked twice — reload clears any stuck animation/hydration state
         console.log('Reloading page to reset UI state...')
         await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 })
-        await page.waitForTimeout(3000)
+        await page.waitForTimeout(15000)
       }
       await clickFirstVisible(advancedTabSel)
       for (let i = 0; i < 10 && !(await advancedActive()); i++) {
@@ -647,23 +663,29 @@ const page = browser.pages()[0] || await browser.newPage()
     // rendered yet on initial page load.
     // v6 available via session flag 'voices-v6'.
     try {
-      const modelBtn = await page.$('button:has-text("v5.5"), button:has-text("v5"), button:has-text("v6"), button:has-text("v4"), button:has-text("v3.5")')
+      const modelBtn = await page.$('button:has-text("v5.5"), button:has-text("v5"), button:has-text("v6"), button:has-text("v6-wild"), button:has-text("v4"), button:has-text("v3.5")')
       if (modelBtn) {
         await modelBtn.click()
         await page.waitForTimeout(500)
-        // Prefer v6 if available, else fall back to v5.5
-        const v6 = await page.$('[role="menuitemradio"]:has-text("v6"), [role="menuitemradio"]:has-text("v6.0")')
-        if (v6) {
-          await v6.click()
-          console.log('Model set to v6')
+        // Prefer v6-wild (creative exploration) over v6 (flagship)
+        const v6wild = await page.$('[role="menuitemradio"]:has-text("v6-wild")')
+        if (v6wild) {
+          await v6wild.click()
+          console.log('Model set to v6-wild')
         } else {
-          const v55 = await page.$('[role="menuitemradio"]:has-text("v5.5")')
-          if (v55) {
-            await v55.click()
-            console.log('Model set to v5.5')
+          const v6 = await page.$('[role="menuitemradio"]:has-text("v6"), [role="menuitemradio"]:has-text("v6.0")')
+          if (v6) {
+            await v6.click()
+            console.log('Model set to v6 (fallback, no v6-wild)')
           } else {
-            console.warn('⚠️  v5.5/v6 menu item not found — closing dropdown')
-            await page.keyboard.press('Escape')
+            const v55 = await page.$('[role="menuitemradio"]:has-text("v5.5")')
+            if (v55) {
+              await v55.click()
+              console.log('Model set to v5.5')
+            } else {
+              console.warn('⚠️  v5.5/v6 menu item not found — closing dropdown')
+              await page.keyboard.press('Escape')
+            }
           }
         }
       } else {
@@ -789,6 +811,18 @@ const page = browser.pages()[0] || await browser.newPage()
 
     beforeSongIds = new Set(await songIdsOnPage())
 
+    // Also capture the real /api/feed/v3 JSON before Create — this returns
+    // every clip regardless of sidebar Filters, so the post-Create diff can
+    // find the new clip even when the DOM sidebar hides it.
+    try {
+      const res = await page.request.fetch('https://studio-api-prod.suno.com/api/feed/v3', { method: 'GET' })
+      if (res.ok()) {
+        const j = await res.json()
+        const ids = (j.clips || []).map(c => c.id).filter(Boolean)
+        if (ids.length) { feedBaseline = new Set(ids); console.log(`FEED-baseline pre-create: ${ids.length} clip ids (first 3: ${ids.slice(0,3).join(',')})`) }
+      }
+    } catch (e) { console.warn('feed/v3 baseline fetch failed:', e.message) }
+
     // Click Create button
     const createSelectors = [
       'button:has-text("Song erstellen"):visible',
@@ -871,35 +905,90 @@ const page = browser.pages()[0] || await browser.newPage()
     console.log('Waiting for generation (up to 5 min) — polling /song/<uuid> links for new song...')
     let waitLoopErrors = 0
     let feedBaseline = null
-    const deadline = Date.now() + 300000
+    let filtersCleared = false
+    const deadline = Date.now() + 720000
     while (!clipId && Date.now() < deadline) {
       try {
+        // If the page/browser closed mid-generation, break to recovery
+        if (browserClosedDuringGeneration) {
+          console.warn('Browser closed during generation — breaking to run recovery')
+          break
+        }
+        // Suno's sidebar keeps active Filters (date/genre/quality) that hide the
+        // newly generated clip behind a "N new clip hidden by current filters"
+        // banner — the DOM diff then sees nothing and the job times out clean.
+        // Suno keeps the new clip behind a "N new clip hidden by current filters"
+        // banner while sidebar filters are active. Click the banner X every poll
+        // — the previous run captured the clip right after this click.
+        const clickedX = await page.evaluate(() => {
+          const close = [...document.querySelectorAll('button, [role="button"]')]
+            .find(b => /hidden by current filters|dismiss|close/i.test(b.getAttribute('aria-label') || '') || /hidden by current filters/i.test(b.textContent || ''))
+          if (close) { close.click(); return true }
+          const x = [...document.querySelectorAll('[class*="toast"] [class*="close"], [class*="banner"] [class*="close"], .toast-x')].find(el => el)
+          if (x) { x.click(); return true }
+          return false
+        })
+        if (clickedX) { console.log('[FILTERS] clicked-x'); await page.waitForTimeout(1200) }
+        // page.evaluate(fetch) is intercepted by page.route() (the Service Worker
+        // routes /api/feed/v3 through the inject-FAKE handler). Use Playwright's
+        // page.request.fetch instead — it talks to the network directly, bypassing
+        // page.route(), so we read the REAL feed and diff every clip regardless
+        // of the sidebar's active Filters.
+        if (!clipId && !feedBaseline) {
+          try {
+            const res = await page.request.fetch('https://studio-api-prod.suno.com/api/feed/v3', { method: 'GET' })
+            if (res.ok()) {
+              const j = await res.json()
+              const ids = (j.clips || []).map(c => c.id).filter(Boolean)
+              if (ids.length) {
+                feedBaseline = new Set(ids)
+                console.log(`FEED-baseline: ${ids.length} clip ids (first 3: ${ids.slice(0,3).join(',')})`)
+              }
+            }
+          } catch (e) { console.warn('feed/v3 baseline fetch failed:', e.message) }
+        }
+        if (!clipId && feedBaseline) {
+          try {
+            const res = await page.request.fetch('https://studio-api-prod.suno.com/api/feed/v3', { method: 'GET' })
+            if (res.ok()) {
+              const j = await res.json()
+              const ids = (j.clips || []).map(c => c.id).filter(Boolean)
+              const newId = ids.find(id => !feedBaseline.has(id) && !rejectedClipIds.has(id))
+              if (newId) await trySetClipId(newId, 'feed/v3 diff')
+            }
+          } catch (e) { console.warn('feed/v3 diff fetch failed:', e.message) }
+        }
         const songIds = await songIdsOnPage()
         if (songIds.length === 0) {
           console.warn('No /song/ links on page yet — retrying')
         } else if (!feedBaseline) {
-          feedBaseline = new Set(songIds)
-          console.log(`DOM-baseline: ${feedBaseline.size} existing song links`)
+          // Use the PRE-CREATE snapshot (beforeSongIds) as the baseline, NOT a
+          // fresh post-Create snapshot — Suno's sidebar already contains the
+          // new clip by the first poll, so a fresh baseline would hide it.
+          feedBaseline = beforeSongIds
+          console.log(`DOM-baseline: ${feedBaseline.size} existing song links (pre-create)`)
         } else {
           const newId = songIds.find(id => !feedBaseline.has(id) && !rejectedClipIds.has(id))
           if (newId) await trySetClipId(newId, 'DOM /song/ diff')
         }
         // Also check URL — Suno may navigate to /song/<uuid> on generation
-        const curUrl = page.url()
+        const curUrl = await page.url()
         const urlId = curUrl.match(/\/song\/([a-f0-9-]{36})/)?.[1]
         if (urlId) await trySetClipId(urlId, 'URL check')
         waitLoopErrors = 0 // reset on success
-      } catch (e) {
-        waitLoopErrors++
-        console.warn(`Wait loop error #${waitLoopErrors} (browser may have closed):`, e.message)
-        // If browser context is destroyed, break so recovery logic can run
-        if (browserClosedDuringGeneration || /context.*closed|target.*closed|page.*closed/i.test(e.message)) {
-          console.warn('Browser context lost — breaking to run recovery')
-          break
+} catch (e) {
+          waitLoopErrors++
+          console.warn(`Wait loop error #${waitLoopErrors} (browser may have closed):`, e.message)
+          // If browser context is destroyed, break so recovery logic can run
+          if (browserClosedDuringGeneration || /context.*closed|target.*closed|page.*closed/i.test(e.message)) {
+            console.warn('Browser context lost — breaking to run recovery')
+            break
+          }
+          // Transient error — keep polling
+          await new Promise((r) => setTimeout(r, 3000))
         }
-        // Transient error — keep polling
-        await new Promise((r) => setTimeout(r, 3000))
-      }
+      // Delay between poll iterations to avoid tight loop
+      await new Promise((r) => setTimeout(r, 5000))
     }
 
     // If page closed during generation, check if we captured the URL
@@ -932,7 +1021,7 @@ const page = browser.pages()[0] || await browser.newPage()
           const newBrowser = await chromium.launchPersistentContext(
             JOB_PROFILE_DIR(jobId),
             {
-              headless: true,
+headless: LOGIN_MODE ? false : true,
               args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--profile-directory=Default', '--disable-gpu', '--disable-setuid-sandbox', '--disable-extensions', '--no-zygote'],
               viewport: { width: 1280, height: 900 },
               acceptDownloads: true,
@@ -974,26 +1063,26 @@ const page = browser.pages()[0] || await browser.newPage()
       // Try fetch-based download first (works even when browser page is closed)
       if (audioDownloadUrl) {
         try {
-          const fetched = await fetchAudio(audioDownloadUrl, clipId, jobId)
-          audioUrl = fetched.audioUrl; flacUrl = fetched.flacUrl
+          const fetched = await fetchAudio(audioDownloadUrl, clipId, jobId, artistName)
+          audioUrl = fetched.audioUrl; flacPath = fetched.flacPath
           console.log(`✅ Audio fetched and uploaded: ${audioUrl}`)
         } catch (e) {
           console.error(`❌ Fetch download failed: ${e.message}`)
           // Fallback to browser-based download
           try {
-            const dl = await downloadRealAudio(page, clipId, jobId, job.title)
-            audioUrl = dl.audioUrl; flacUrl = dl.flacUrl
+const dl = await downloadRealAudio(page, clipId, jobId, title, artistName)
+             audioUrl = dl.audioUrl; flacPath = dl.flacPath
             console.log(`✅ Real audio downloaded and uploaded: ${audioUrl}`)
           } catch (e2) {
             console.error('❌ Download-flow failed:', e2.message)
           }
         }
       } else {
-        try {
-          const dl = await downloadRealAudio(page, clipId, jobId, job.title)
-          audioUrl = dl.audioUrl; flacUrl = dl.flacUrl
-          console.log(`✅ Real audio downloaded and uploaded: ${audioUrl}`)
-        } catch (e) {
+try {
+           const dl = await downloadRealAudio(page, clipId, jobId, title, artistName)
+           audioUrl = dl.audioUrl; flacPath = dl.flacPath
+           console.log(`✅ Real audio downloaded and uploaded: ${audioUrl}`)
+         } catch (e) {
           console.error('❌ Download-flow failed:', e.message)
         }
       }
@@ -1021,7 +1110,7 @@ const page = browser.pages()[0] || await browser.newPage()
     }
   }
 
-  return { clipId, audioUrl, flacUrl }
+  return { clipId, audioUrl, flacPath }
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────────
@@ -1037,20 +1126,29 @@ async function main() {
 
   const { data: jobs } = await sb
     .from('generation_jobs')
-    .select('*, artists(*)')
+    .select('id,status,artist_id,replicate_prediction_id,title,prompt,bpm,key_signature,genre,mood')
     .eq('status', 'pending')
     .like('replicate_prediction_id', 'suno_pending_%')
     .limit(2) // max 2 at a time (Suno Pro allows parallel)
 
-  if (!jobs?.length) {
+  // Retry previously failed jobs up to 3 attempts before DLQ
+  const { data: failedJobs } = await sb
+    .from('generation_jobs')
+    .select('id,status,artist_id,replicate_prediction_id,title,prompt,bpm,key_signature,genre,mood')
+    .eq('status', 'failed')
+    .limit(2)
+
+  const jobsToProcess = [...(jobs ?? []), ...(failedJobs ?? [])]
+  console.log(`[DEBUG] jobs=${(jobs ?? []).length}, failedJobs=${(failedJobs ?? []).length}, total=${jobsToProcess.length}`)
+  if (!jobsToProcess.length) {
     console.log('No queued Suno jobs.')
     return
   }
 
-  console.log(`Found ${jobs.length} queued job(s)`)
+  console.log(`Found ${jobsToProcess.length} queued/retry job(s)`)
 
-  for (const job of jobs) {
-    const artist = job.artists
+  for (const job of jobsToProcess) {
+    const artist = { id: job.artist_id, style_dna: {} }
     const dna = artist?.style_dna || {}
     // prompt_template is stored as "<style prose>\n\n[LYRICS]\n<bar-tagged arrangement>".
     // Style prose goes in Suno's Style-of-Music field; the arrangement goes in the
@@ -1090,7 +1188,8 @@ async function main() {
     }
 
     try {
-      const result = await generateSong(prompt, style, job.id, job.title)
+      const artistName = artist?.name?.replace(/[^a-zA-Z0-9]/g, '_') || 'UNKNOWN_ARTIST'
+      const result = await generateSong(prompt, style, job.id, job.title, artistName)
       const clipId = result?.clipId
       const audioUrl = result?.audioUrl
 
@@ -1118,7 +1217,6 @@ async function main() {
         if (updateErr) console.error(`❌ Job ${job.id} DB update (failed-mark) also failed: ${updateErr.message}`)
         console.log(`❌ Job ${job.id} marked as failed (no audio_url)`)
       } else {
-        // Mark as failed after too many attempts (optional: add attempt counter)
         const { error: updateErr } = await sb.from('generation_jobs').update({
           status: 'failed',
           error: 'Suno worker: generation timed out or UI error',
@@ -1133,6 +1231,7 @@ async function main() {
         error: `Suno worker error: ${e.message}`,
       }).eq('id', job.id)
       if (updateErr) console.error(`❌ Job ${job.id} DB update (catch-path) also failed: ${updateErr.message}`)
+      console.log(`❌ Job ${job.id} marked as failed`)
     }
   }
 

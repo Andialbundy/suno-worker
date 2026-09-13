@@ -1,12 +1,15 @@
 import { createClient } from '@supabase/supabase-js'
 import { randomUUID } from 'crypto'
-import { writeFileSync, readFileSync, rmSync } from 'node:fs'
+import { writeFileSync, readFileSync, rmSync, writeFileSync as writeFileFs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { execSync } from 'node:child_process'
 import { renderHudCover } from './render-cover-hud.mjs'
 import { generateCover, FLUX_SCHNELL, COST_PER_MODEL } from './replicate.mjs'
 import { composePrompt } from './cover-prompt.mjs'
 import { loadSpend, saveSpend, recordSpend, shouldAlert, markAlerted, remainingUsd } from './spend-tracker.mjs'
+
+const QNAP_FLAC_BASE = '/mnt/qnap-multimedia/Musik/andra.network'
 
 function makeLazySb() {
   let client
@@ -107,10 +110,44 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         spend = markAlerted(spend)
         saveSpend(spend)
       }
+
       const mp3Res = await fetch(job.audio_url)
       const mp3Buf = mp3Res.ok ? await mp3Res.arrayBuffer() : null
       if (!mp3Buf || !isValidMedia(mp3Buf)) throw new Error('invalid audio')
-      const audio_url = await uploadBucket('tracks', `audio/${trackId}.mp3`, mp3Buf, 'audio/mpeg')
+
+      // End-user format: WAV only (convert MP3→WAV via ffmpeg)
+      const mp3Path = join(tmpdir(), `finalize_${trackId}.mp3`)
+      const wavPath = join(tmpdir(), `finalize_${trackId}.wav`)
+      writeFileSync(mp3Path, Buffer.from(mp3Buf))
+      try {
+        execSync(`ffmpeg -y -v error -i "${mp3Path}" -ac 2 -ar 44100 -f wav "${wavPath}"`, { timeout: 30000 })
+        const wavBuf = readFileSync(wavPath)
+        const audio_url = await uploadBucket('tracks', `audio/${trackId}.wav`, wavBuf, 'audio/wav')
+      } catch (e) {
+        console.error('WAV conversion failed, falling back to MP3:', e.message)
+        const audio_url = await uploadBucket('tracks', `audio/${trackId}.mp3`, mp3Buf, 'audio/mpeg')
+      }
+
+      // FLAC-Master goes ONLY to QNAP (never Supabase)
+      let storage_path = null
+      try {
+        const artistName = (await sb.from('artists').select('name').eq('id', job.artist_id).single()).data?.name?.replace(/[^a-zA-Z0-9]/g, '_') || 'UNKNOWN_ARTIST'
+        const qnapFlacDir = join(QNAP_FLAC_BASE, artistName, 'flac')
+        const qnapFlacPath = join(qnapFlacDir, `flac_${trackId}.flac`)
+        const { data: master } = await sb.storage.from('tracks').getPublicUrl(`audio/master/${job.id}.flac`)
+        if (master?.publicUrl) {
+          const mres = await fetch(master.publicUrl)
+          if (mres.ok) {
+            const flacBuf = Buffer.from(await mres.arrayBuffer())
+            // Write FLAC master to QNAP path
+            execSync(`mkdir -p "${qnapFlacDir}"`, { timeout: 5000 })
+            writeFileSync(qnapFlacPath, flacBuf)
+            storage_path = `qnap://${artistName}/flac/flac_${trackId}.flac`
+            console.log(`FLAC master written to QNAP: ${qnapFlacPath}`)
+          }
+        }
+      } catch (e) { console.error('FLAC master not available for QNAP:', e.message) }
+
       const { count: trackCount } = await sb.from('tracks').select('*', { count: 'exact', head: true }).eq('artist_id', job.artist_id)
       const version = (trackCount ?? 0) + 1
       const shouldPublish = version >= AUTO_PUBLISH_AFTER
@@ -133,6 +170,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         mood: job.mood,
         image_prompt: job.image_prompt,
         generation_cost_usd: 0.003,
+        storage_path,
         generation_log: [`Job: ${job.id}`, `Suno id: ${job.replicate_prediction_id}`, `Artist: ${artist.name}`, `Audio: ${audio_url}`, `Cover: ${cover_url}`, `Version: ${version} | Published: ${shouldPublish}`],
       }).select().single()
       if (dbErr) throw new Error(dbErr.message)
