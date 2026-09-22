@@ -14,7 +14,7 @@ npm install
 node --env-file=.env src/worker.mjs
 
 # Tests
-node --env-file=.env --test test/harvest-flac.test.mjs
+node --env-file=.env --test test/comfy.test.mjs   # 11 Tests, alle grün
 # oder alle Tests
 node --env-file=.env --test
 ```
@@ -29,14 +29,21 @@ Siehe [`ARCHITECTURE.md`](ARCHITECTURE.md) — vollständige Pipeline (Vercel Cr
 |---|---|
 | `src/worker.mjs` | Haupt-Worker (Browser-Automation, Suno-Generierung, MP3/FLAC-Harvest) |
 | `src/finalize-gp.mjs` | Finalisierung (Cover, Track-Insert, Publish, Toolost) |
-| `src/harvest-flac.mjs` | **NEU** MSE-Harvest + FLAC-Transcode (Opus→FLAC 48kHz/s16) |
-| `src/batch_flac_from_db.mjs` | Legacy: MP3→FLAC Batch |
+| `src/harvest-flac.mjs` | MSE-Harvest + FLAC-Transcode (Opus→FLAC 48kHz/s16) |
+| `src/comfy.mjs` | Bildgenerierung via ganty32 ComfyUI (Primary) + Replicate (Fallback) |
+| `src/cover-prompt.mjs` | Cover Prompt Building |
 
 ## Tests
 
-```
-test/harvest-flac.test.mjs   # 6 Tests: transcode, harvest, fallback, MERGE_SCRIPT
-```
+| Test | Status |
+|---|---|
+| `test/comfy.test.mjs` | ✅ 11/11 passing |
+| `test/cover-prompt.test.mjs` | ✅ passing |
+| `test/spend-tracker.test.mjs` | ✅ passing |
+| `test/set-artist-templates.test.mjs` | ✅ passing |
+| `test/gencover.test.mjs` | ❌ pre-existing: needs SVG brand assets + render-cover-hud |
+| `test/regen-covers.test.mjs` | ❌ pre-existing: needs SVG brand assets + render-cover-hud |
+| `test/harvest-flac.test.mjs` | ❌ pre-existing: harvest-flac.mjs missing MERGE_SCRIPT export |
 
 ## Deployment (Produktiv)
 
