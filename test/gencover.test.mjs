@@ -16,12 +16,12 @@ test('genCover forwards the composed prompt verbatim to generate', async () => {
     generate: async (token, { prompt }) => { sent.push({ token, prompt }); return Buffer.from([1]) },
   })
   assert.equal(sent[0].prompt, 'ice cathedral, cold, high detail, 8k, cinematic lighting')
-  assert.ok('token' in sent[0]) // token is the REPLICATE_API_TOKEN (undefined in tests <= no env; confirm the arg is passed through)
+  assert.ok('token' in sent[0]) // token is the AI_ENGINE_TOKEN
 })
 
 test('genCover throws propagate from generate', async () => {
   await assert.rejects(
-    genCover('x', {}, { generate: async () => { throw new Error('REPLICATE_API_TOKEN missing') } }),
+    genCover('x', {}, { generate: async () => { throw new Error('AI_ENGINE_TOKEN missing') } }),
     /missing/
   )
 })

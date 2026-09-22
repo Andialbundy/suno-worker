@@ -5,7 +5,7 @@
 ```bash
 # Environment (3 Variablen)
 cp .env.example .env
-# SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, REPLICATE_API_TOKEN
+# SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, AI_ENGINE_TOKEN
 
 # Install
 npm install

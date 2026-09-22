@@ -2,7 +2,7 @@
 
 ```
 suno-worker/
-├── .env                          # SUPABASE_URL, SERVICE_ROLE_KEY, REPLICATE_API_TOKEN
+├── .env                          # SUPABASE_URL, SERVICE_ROLE_KEY, AI_ENGINE_TOKEN (REPLICATE_API_TOKEN optional for fallback)
 ├── .git/
 ├── ARCHITECTURE.md               # Pipeline-Architektur (Worker + Vercel + systemd + Docker)
 ├── CLAUDE.md                     # User-Instructions
@@ -13,13 +13,11 @@ suno-worker/
 │
 ├── src/                          # PRODUKTIONSCODE
 │   ├── worker.mjs                # Haupt-Worker (Suno-Generierung, MP3/FLAC-Harvest)
-│   ├── finalize-gp.mjs           # Finalisierung (Cover, Track-Insert, Publish, Toolost)
-│   ├── harvest-flac.mjs          # NEU: MSE-Harvest + FLAC-Transcode (Opus→FLAC 48kHz/s16)
-│   ├── batch_flac_from_db.mjs    # Legacy: MP3→FLAC Batch
-│   ├── analyse_flac_key_bpm.mjs  # Key/BPM Analyse (Placeholder)
+│   ├── finalize-gp.mjs           # Finalization (Cover, Track-Insert, Publish, Toolost)
 │   ├── cover-prompt.mjs          # Cover Prompt Building
+│   ├── analyse_flac_key_bpm.mjs  # Key/BPM Analyse (Placeholder)
 │   ├── generate-jobs.mjs         # Job-Generierung (Prompt, Title, Image)
-│   ├── replicate.mjs             # Replicate API (Flux für Cover)
+│   ├── comfy.mjs             # ComfyUI/ai-engine API (Bildgenerierung, ganty32)
 │   ├── spend-tracker.mjs         # Suno Credits Tracking
 │   ├── render-cover-hud.mjs      # HUD Overlay Renderer (Playwright)
 │   ├── regen-covers.mjs          # Cover Regeneration Batch
@@ -28,7 +26,13 @@ suno-worker/
 │   └── set-artist-templates.mjs  # Artist DNA Templates
 │
 ├── test/
-│   └── harvest-flac.test.mjs     # 6 Tests: transcode, harvest, fallback, MERGE_SCRIPT
+│   ├── comfy.test.mjs          # 11 Tests: ganty32 API, Replicate fallback, model mapping
+│   ├── gencover.test.mjs       # (pre-existing: missing @supabase/supabase-js)
+│   ├── regen-covers.test.mjs   # (pre-existing: missing @supabase/supabase-js)
+│   ├── harvest-flac.test.mjs   # (pre-existing: missing src/harvest-flac.mjs)
+│   ├── cover-prompt.test.mjs
+│   ├── spend-tracker.test.mjs
+│   └── set-artist-templates.test.mjs
 │
 ├── docs/
 │   ├── flow-tree.md              # Flow Tree Visualisierung
@@ -72,7 +76,7 @@ suno-worker/
 | Befehl | Zweck |
 |---|---|
 | `node --env-file=.env src/worker.mjs` | Worker manuell starten |
-| `node --env-file=.env --test test/harvest-flac.test.mjs` | FLAC-Tests |
+| `node --env-file=.env --test test/comfy.test.mjs` | Comfy/cover gen tests (11) |
 | `node --env-file=.env src/finalize-gp.mjs` | Finalisierung (nach Worker-Job) |
 | `docker build -t suno-worker:chrome .` | Docker Image für systemd |
 

@@ -2,7 +2,7 @@
 import { composePrompt } from './cover-prompt.mjs'
 import { genBaseAndCover } from './finalize-gp.mjs'
 import { loadSpend, recordSpend, saveSpend, shouldAlert, markAlerted, remainingUsd } from './spend-tracker.mjs'
-import { COST_PER_MODEL, FLUX_SCHNELL, FLUX_PRO } from './replicate.mjs'
+import { COST_PER_MODEL, FLUX_SCHNELL, FLUX_PRO } from './comfy.mjs'
 
 export const OFFICIAL_TITLE_EXCLUDE = /Test|Chrome|Loop|\bTrack\s?\d|Final Stability|Recovery|Noise Loop|^Track/i
 

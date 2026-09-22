@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execSync } from 'node:child_process'
 import { renderHudCover } from './render-cover-hud.mjs'
-import { generateCover, FLUX_SCHNELL, COST_PER_MODEL } from './replicate.mjs'
+import { generateCover, FLUX_SCHNELL, COST_PER_MODEL, REPLICATE_COST } from './comfy.mjs'
 import { composePrompt } from './cover-prompt.mjs'
 import { loadSpend, saveSpend, recordSpend, shouldAlert, markAlerted, remainingUsd } from './spend-tracker.mjs'
 
@@ -21,7 +21,6 @@ function makeLazySb() {
   })
 }
 const sb = makeLazySb()
-const AI = { base: 'http://100.100.71.76:8190', token: process.env.AI_ENGINE_TOKEN }
 const JOB_IDS = [
   'ac900c54-36df-4d91-ab29-ef12ab52e3a5',
   '2c3adb14-8d8d-4bd5-9814-90a2e9fa6e90',
@@ -55,7 +54,7 @@ async function writeBaseAndOverlay({ base, artist, title }) {
 
 export async function genCover(prompt, { artist, title, model = FLUX_SCHNELL } = {}, deps = {}) {
   const gen = deps.generate ?? generateCover
-  const base = await gen(process.env.REPLICATE_API_TOKEN, { model, prompt })
+  const base = await gen(process.env.AI_ENGINE_TOKEN, { model, prompt })
   if (!artist || !title) return base
   const { base: basePath, cover: outPath } = await writeBaseAndOverlay({ base, artist, title })
   try {
@@ -68,7 +67,7 @@ export async function genCover(prompt, { artist, title, model = FLUX_SCHNELL } =
 
 export async function genBaseAndCover(prompt, { artist, title, model = FLUX_SCHNELL } = {}, deps = {}) {
   const gen = deps.generate ?? generateCover
-  const base = await gen(process.env.REPLICATE_API_TOKEN, { model, prompt })
+  const base = await gen(process.env.AI_ENGINE_TOKEN, { model, prompt })
   if (!artist || !title) return { base, cover: base }
   const { base: basePath, cover: outPath } = await writeBaseAndOverlay({ base, artist, title })
   try {
@@ -104,9 +103,10 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       const cover_url = await uploadBucket('tracks', `covers/${trackId}.png`, coverBuf, 'image/png')
       const cover_base_url = await uploadBucket('tracks', `covers/${trackId}_base.png`, baseCover, 'image/png')
       spend = recordSpend(spend, { model: FLUX_SCHNELL, cost: COST_PER_MODEL[FLUX_SCHNELL], trackTitle: job.title, predictionId: job.id })
+      // Note: if Replicate fallback is used, actual cost is REPLICATE_COST[FLUX_SCHNELL] ($0.003)
       saveSpend(spend)
       if (shouldAlert(spend)) {
-        console.log('REPLICATE BUDGET ALERT:', remainingUsd(spend), 'USD left -', spend.total_usd, 'USD spent')
+        console.log('COVER GEN BUDGET ALERT:', remainingUsd(spend), 'USD left -', spend.total_usd, 'USD spent')
         spend = markAlerted(spend)
         saveSpend(spend)
       }
@@ -169,7 +169,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         genre: job.genre,
         mood: job.mood,
         image_prompt: job.image_prompt,
-        generation_cost_usd: 0.003,
+        generation_cost_usd: 0,
         storage_path,
         generation_log: [`Job: ${job.id}`, `Suno id: ${job.replicate_prediction_id}`, `Artist: ${artist.name}`, `Audio: ${audio_url}`, `Cover: ${cover_url}`, `Version: ${version} | Published: ${shouldPublish}`],
       }).select().single()
