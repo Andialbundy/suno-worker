@@ -15,6 +15,7 @@ suno-worker/
 │   ├── worker.mjs                # Haupt-Worker (Suno-Generierung, MP3/FLAC-Harvest)
 │   ├── finalize-gp.mjs           # Finalization (Cover, Track-Insert, Publish, Toolost)
 │   ├── cover-prompt.mjs          # Cover Prompt Building
+│   ├── harvest-flac.mjs          # MSE-Harvest + FLAC-Transcode (test pre-existing failure)
 │   ├── analyse_flac_key_bpm.mjs  # Key/BPM Analyse (Placeholder)
 │   ├── generate-jobs.mjs         # Job-Generierung (Prompt, Title, Image)
 │   ├── comfy.mjs             # ComfyUI/ai-engine API (Bildgenerierung, ganty32)
@@ -29,7 +30,7 @@ suno-worker/
 │   ├── comfy.test.mjs          # 11 Tests: ganty32 API, Replicate fallback, model mapping
 │   ├── gencover.test.mjs       # (pre-existing: missing @supabase/supabase-js)
 │   ├── regen-covers.test.mjs   # (pre-existing: missing @supabase/supabase-js)
-│   ├── harvest-flac.test.mjs   # (pre-existing: missing src/harvest-flac.mjs)
+│   ├── harvest-flac.test.mjs   # pre-existing: missing MERGE_SCRIPT export in harvest-flac.mjs
 │   ├── cover-prompt.test.mjs
 │   ├── spend-tracker.test.mjs
 │   └── set-artist-templates.test.mjs
