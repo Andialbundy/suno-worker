@@ -28,9 +28,9 @@ suno-worker/
 │
 ├── test/
 │   ├── comfy.test.mjs          # 11 Tests: ganty32 API, Replicate fallback, model mapping
-│   ├── gencover.test.mjs       # (pre-existing: missing @supabase/supabase-js)
-│   ├── regen-covers.test.mjs   # (pre-existing: missing @supabase/supabase-js)
-│   ├── harvest-flac.test.mjs   # pre-existing: missing MERGE_SCRIPT export in harvest-flac.mjs
+│   ├── gencover.test.mjs       # pre-existing: SVG brand assets missing
+│   ├── regen-covers.test.mjs   # pre-existing: SVG brand assets missing
+│   ├── harvest-flac.test.mjs   # pre-existing: MERGE_SCRIPT export missing
 │   ├── cover-prompt.test.mjs
 │   ├── spend-tracker.test.mjs
 │   └── set-artist-templates.test.mjs
