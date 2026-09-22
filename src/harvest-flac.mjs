@@ -95,3 +95,14 @@ export function probeSeconds(filePath) {
     return 0
   }
 }
+
+export const MERGE_SCRIPT = `
+  return (window.__segs && Array.isArray(window.__segs)) ? { ok: true, count: window.__msCount ?? window.__segs.length } : { ok: false, reason: 'no segs' }
+`
+
+export function computeTrim({ decodedSeconds, groundTruthSeconds, sampleRate }) {
+  if (decodedSeconds > groundTruthSeconds + 0.1) {
+    return { cut: true, endSample: Math.floor(groundTruthSeconds * sampleRate) }
+  }
+  return { cut: false }
+}

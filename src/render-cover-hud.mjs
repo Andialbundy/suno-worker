@@ -3,10 +3,12 @@ import { tmpdir } from 'node:os'
 import { join, basename } from 'node:path'
 import { chromium } from 'playwright'
 
+import { existsSync } from 'node:fs'
+
 const SIZE = 1024
 
 const cfg = JSON.parse(readFileSync(new URL('./cover-hud.json', import.meta.url), 'utf8'))
-const brandSvg = cfg.brandSvg && readFileSync(cfg.brandSvg, 'utf8')
+const brandSvg = cfg.brandSvg && existsSync(cfg.brandSvg) && readFileSync(cfg.brandSvg, 'utf8')
 const display = cfg.fonts.display
 const gl = (c) => `rgba(${parseInt(c.slice(1, 3), 16)},${parseInt(c.slice(3, 5), 16)},${parseInt(c.slice(5, 7), 16)},`
 
