@@ -16,6 +16,7 @@ import { createClient } from '@supabase/supabase-js'
 import { homedir, tmpdir } from 'os'
 import { join } from 'path'
 import { readFile, rm, writeFile } from 'fs/promises'
+import { execSync } from 'child_process'
 import { MSE_PATCH, harvestSegments, transcodeToFlac, fallbackMp3ToFlac, probeSeconds } from './harvest-flac.mjs'
 
 // QNAP FLAC master storage path (FLACs live ONLY on QNAP, not Supabase)
@@ -174,33 +175,20 @@ function extractClipId(url) {
   return m ? m[1] : null
 }
 
-// ── Download real audio via Suno's own Download UI ──────────────────────────
-// Suno encrypts clip delivery at rest (confirmed 2026-08-29: x-amz-server-side-
-// encryption: AES256, raw bytes have no ftyp box). A server-side fetch of the
-// CDN URL can only ever retrieve ciphertext. Suno's own "Download > MP3 Audio"
-// menu action produces a real, already-decrypted file via a genuine browser
-// download (an entitlement of this Suno account) — confirmed via recon this
-// menu only appears on songs owned by this account, not on public/other songs.
+// ── Capture audio from the live player ───────────────────────────────────────
+// Suno encrypts clip delivery at rest (AES256; raw CDN bytes have no ftyp box),
+// the in-page Download menu is gone, and a fetch of the CDN URL only yields
+// ciphertext — so we drive the real <audio> element through captureStream,
+// route it into an AudioContext + ScriptProcessor, record the PCM as 48kHz
+// stereo Int16 in the page, transfer it out over a raw CDP session (Playwright
+// truncates large evaluate returns; CDP does not), RMS-trim pre-roll/padding
+// to the song's real span, keep a full-fidelity master WAV in /app/out (host
+// produces FLAC→QNAP), and upload a 44.1kHz mono reduction to Supabase Storage
+// (caps ~50MB/object).
 async function downloadRealAudio(page, clipId, jobId, jobTitle = '', artistName) {
-  await page.addInitScript(MSE_PATCH)
   await page.goto(`https://suno.com/song/${clipId}`, { waitUntil: 'domcontentloaded', timeout: 20000 })
-  await page.waitForTimeout(2000)
+  await page.waitForTimeout(1500)
 
-  // A new /song/<uuid> link appears in the sidebar the instant generation is
-  // SUBMITTED, well before Suno finishes rendering — confirmed 2026-08-29 by a
-  // Download attempt timing out because the song wasn't actually ready yet.
-  // "sil-100.mp3" is Suno's silence placeholder shown while still generating;
-  // a real (non-placeholder) <audio> src only appears once the song is done —
-  // poll for that as the readiness gate before touching the Download menu.
-  // Exact aria-label match — a substring match (e.g. "Play" i) hits "Play Count"
-  // (a stat label, not a button) first in DOM order on the song page, confirmed
-  // via recon 2026-08-29: clicking it never starts playback, so the readiness
-  // gate below never passes regardless of how long it waits.
-  // The Play button exists in the DOM while the song is still generating but
-  // doesn't do anything yet (nothing to play) — a one-shot click before the
-  // song is ready is a no-op, confirmed 2026-08-29 (4min wait, never readied).
-  // Retry the click every iteration so it "catches" the moment playback
-  // actually becomes available, instead of only trying once up front.
   async function clickPlay() {
     for (const el of await page.$$('button[aria-label="Play"]')) {
       try {
@@ -209,79 +197,340 @@ async function downloadRealAudio(page, clipId, jobId, jobTitle = '', artistName)
       } catch {}
     }
   }
-  let ready = false
-  for (let i = 0; i < 120; i++) {
-    await clickPlay().catch(() => {})
-    const srcs = await page.evaluate(() =>
-      [...document.querySelectorAll('audio')].map(a => a.src).filter(Boolean))
-    if (srcs.some(s => !s.includes('sil-100'))) { ready = true; break }
-    await page.waitForTimeout(15000)
-  }
-  if (!ready) throw new Error('Song never left placeholder/generating state (6min wait)')
 
-  const menuBtn = await page.$('button[aria-label="More menu contents"]')
-  if (!menuBtn) throw new Error('More menu button not found on song page')
-  await menuBtn.click()
-  await page.waitForTimeout(1000) // Wait for menu to open
+  // Capture round on the CURRENT page. Re-attaches when Suno swaps the audio
+  // element (the player does that on stalls; the stale element outputs silence).
+  const doCapture = () => page.evaluate(() => new Promise((resolve) => {
+    window.__capL = []; window.__capR = []; window.__capSamples = 0
+    window.__maxDur = 0; window.__stable = 0; window.__lastSamples = -1
+    window.__capStartCur = 0
+    window.__t0 = Date.now(); window.__msg = ''
+    let closed = false
+    let capEl = null, capNode = null
 
-  // Take debug screenshot to see menu state
-  const debugPath = join(tmpdir(), `debug_before_download_${jobId}.png`)
-  await page.screenshot({ path: debugPath })
-  console.log(`Saved debug screenshot: ${debugPath}`)
-
-  // Click MP3 Audio directly (no hover needed if menu is visible)
-  const mp3Option = await page.getByText('MP3 Audio', { exact: true })
-  if (!mp3Option) {
-    throw new Error('MP3 Audio option not found in menu')
-  }
-  
-  const [download] = await Promise.all([
-    page.waitForEvent('download', { timeout: 20000 }),
-    mp3Option.click(),
-  ])
-
-  const tmpPath = join(tmpdir(), `suno_${jobId}.mp3`)
-  await download.saveAs(tmpPath)
-  const buffer = await readFile(tmpPath)
-
-  // End-user format: WAV only (Supabase storage)
-  const wavPath = `audio/raw/${jobId}.wav`
-  const { error } = await sb.storage.from('tracks').upload(wavPath, buffer, {
-    contentType: 'audio/wav',
-    upsert: true,
-  })
-  if (error) throw new Error(`Supabase Storage upload failed: ${error.message}`)
-
-  const { data } = sb.storage.from('tracks').getPublicUrl(wavPath)
-
-  // FLAC-Master goes ONLY to QNAP (never Supabase)
-  let flacPath = null
-  try {
-    const mp3Dur = probeSeconds(tmpPath)
-    const m4aBuf = await harvestSegments(page)
-    let flacBuf
-    if (m4aBuf) {
-      flacBuf = transcodeToFlac(m4aBuf, { groundTruthSeconds: mp3Dur, metadata: { TITLE: jobTitle } })
-    } else {
-      flacBuf = fallbackMp3ToFlac(buffer, { metadata: { TITLE: jobTitle } })
+    const primaryEl = () => {
+      const c = [...document.querySelectorAll('audio')]
+        .filter(x => !x.src.includes('sil-100') && isFinite(x.duration) && x.duration > 20 && x.currentTime > 1)
+      c.sort((a, b) => b.currentTime - a.currentTime)
+      return c[0] || null
     }
-    flacPath = join(QNAP_FLAC_BASE, artistName, 'flac', `flac_${jobId}.flac`)
-    await writeFile(flacPath, flacBuf)
-    console.log(`FLAC master written to QNAP: ${flacPath}`)
-  } catch (e) {
-    console.error('FLAC harvest skipped (WAV only):', e.message)
+
+    const teardown = () => {
+      if (!capNode) return
+      try { capNode.node.onaudioprocess = null; capNode.node.disconnect(); capNode.msSrc.disconnect(); capNode.stream.getTracks().forEach(t => t.stop()); capNode.ctx.close() } catch {}
+      capNode = null
+    }
+
+    const attach = () =>
+      new Promise((res) => {
+        const a = primaryEl()
+        if (!a) return res()
+        if (window.__capSamples > 0 && window.__a === a && capNode) return res()
+        try {
+          // Start capturing from the element's LAST buffered anchor so early
+          // stalls don't cost the whole tail: only (re)create when the element
+          // has already buffered past the initial plateau.
+          if (!(a.currentTime >= 5)) return res()
+          const ctx = new AudioContext()
+          const stream = a.captureStream()
+          const msSrc = ctx.createMediaStreamSource(stream)
+          const node = ctx.createScriptProcessor(8192, 2, 2)
+          msSrc.connect(node); node.connect(ctx.destination)
+          const started = window.__capSamples || 0
+          if (started === 0) window.__capStartCur = a.currentTime || 0
+          node.onaudioprocess = (ev) => {
+            if (closed) return
+            const l = ev.inputBuffer.getChannelData(0)
+            const r = ev.inputBuffer.getChannelData(1)
+            window.__capL.push(l.slice()); window.__capR.push((r && r.length ? r : l).slice())
+            window.__capSamples += l.length
+            if (window.__capSamples >= (window.__maxDur || 0) * 48000 - 48000 && window.__capSamples > started + 48000) window.__enough = true
+          }
+          window.__a = a; capEl = a; capNode = { ctx, msSrc, node, stream, started }
+          window.__msg = 'attached cur=' + a.currentTime.toFixed(1) + ' dur=' + a.duration.toFixed(1)
+        } catch (e) { window.__msg = 'attach err ' + e.message }
+        res()
+      })
+
+    const tick = async () => {
+      const el = primaryEl()
+      if (el) window.__maxDur = Math.max(window.__maxDur || 0, el.duration || 0)
+      if (!capNode) { await attach(); return }
+      const curEl = primaryEl()
+      if (curEl && curEl !== window.__a && curEl.currentTime > (window.__a?.currentTime || 0) + 2) {
+        console.log('[capture] element swapped: new el cur=' + curEl.currentTime.toFixed(1))
+        teardown()
+        await attach()
+        return
+      }
+      const maxDur = window.__maxDur || 0
+      const startCur = window.__capStartCur || 0
+      const needed = Math.round(Math.max(0, maxDur - 0.3 - startCur) * 48000)
+      const complete = window.__capSamples >= needed
+      if (complete && window.__lastSamples === window.__capSamples) window.__stable = (window.__stable || 0) + 1
+      else if (window.__lastSamples !== window.__capSamples) window.__stable = 0
+      window.__lastSamples = window.__capSamples
+      const timeout = Date.now() - window.__t0 > (Math.max(maxDur, 240) + 300) * 1000
+      console.log('[capture] samples=' + window.__capSamples + ' needed=' + needed + ' maxDur=' + maxDur.toFixed(1) + ' stable=' + window.__stable + ' msg=' + window.__msg)
+      const done = (complete && window.__stable >= 3) || timeout
+      if (done) {
+        closed = true
+        clearInterval(window.__capIv)
+        teardown()
+        window.__msg = ''
+        resolve({ samples: window.__capSamples, maxDur: window.__maxDur || maxDur, cur: curEl ? curEl.currentTime : 0, ended: curEl ? curEl.ended : false, wallS: ((Date.now() - window.__t0) / 1000).toFixed(0) })
+      }
+    }
+    window.__capIv = setInterval(tick, 2000)
+  }))
+
+  const SR = 48000
+
+// Ready gate: click Play (sparingly — over-clicking toggles pause/play and can
+// end on pause), then wait until playback actually advances past the plateau.
+  const capPromise = doCapture()
+
+  // Page-freeze watchdog: if the renderer goes quiet (no sample growth) it may
+  // never resolve the in-page promise. Closing the page rejects that promise so
+  // the retry path can recover on a fresh page.
+  const freezeWatch = (async () => {
+    await new Promise(r => setTimeout(r, 45000))
+    let last = -1, frozenSince = 0
+    for (;;) {
+      await new Promise(r => setTimeout(r, 15000))
+      let cur = -1
+      try { cur = await page.evaluate(() => window.__capSamples || 0) } catch {}
+      if (cur === last) {
+        if (!frozenSince) frozenSince = Date.now()
+        if (Date.now() - frozenSince > 150000) {
+          console.log('[capture] page frozen (samples not advancing), closing to break out')
+          try { await page.close() } catch {}
+          return
+        }
+      } else frozenSince = 0
+      last = cur
+    }
+  })()
+
+  let gDur = 0
+  let playTries = 0
+  let lastClickAt = 0
+  for (let i = 0; i < 60; i++) {
+    const st = await page.evaluate(() => {
+      const a = [...document.querySelectorAll('audio')].find(x => !x.src.includes('sil-100') && isFinite(x.duration) && x.duration > 0)
+      return a ? { dur: a.duration, cur: a.currentTime, paused: a.paused } : null
+    }).catch(() => null)
+    if (st && st.dur > 20) {
+      gDur = st.dur
+      if (!st.paused && st.cur >= 5) { console.log(`Ready gate passed, dur=${st.dur.toFixed(1)} cur=${st.cur.toFixed(1)}`); break }
+    }
+    if (Date.now() - lastClickAt > 25000) {
+      await clickPlay().catch(() => {})
+      playTries++; lastClickAt = Date.now()
+      console.log(`[gate] play click #${playTries}${st ? ` (dur=${st.dur.toFixed(1)}, cur=${st.cur.toFixed(1)}, paused=${st.paused})` : ''}`)
+    }
+    await page.waitForTimeout(3000)
+  }
+  if (!gDur) throw new Error('Song never left placeholder/generating state')
+
+  let cap
+  try { cap = await capPromise } catch (e) {
+    console.log('[capture] capPromise rejected:', e.message)
+    cap = null
+  }
+  console.log('CAPTURE done:', JSON.stringify(cap))
+
+  // ── Shared post-capture pipeline (build int16, pull, trim, wav, upload) ──
+  const post = async () => {
+    if (!cap || !cap.samples || cap.maxDur < 30) throw new Error(`capture failed: ${JSON.stringify(cap)}`)
+
+    const built = await page.evaluate((total) => {
+      const L = window.__capL, R = window.__capR
+      const out = new Int16Array(total * 2)
+      let outIdx = 0, got = 0, pi = 0, lo = 0
+      while (got < total && pi < L.length) {
+        const ld = L[pi], rd = R[pi]
+        const n = Math.min(total - got, ld.length - lo)
+        for (let i = 0; i < n; i++) {
+          out[outIdx++] = Math.max(-1, Math.min(1, ld[lo + i])) * 32767 | 0
+          out[outIdx++] = Math.max(-1, Math.min(1, rd[lo + i])) * 32767 | 0
+        }
+        got += n; lo = 0; pi++
+      }
+      window.__i16u = new Uint8Array(out.buffer)
+      return { got }
+    }, cap.samples)
+    console.log('built int16 page buffer, got=' + built.got)
+
+    const session = await page.context().newCDPSession(page)
+    const totalBytes = cap.samples * 4
+    const PULL = 600000
+    const pieces = []
+    for (let off = 0; off < totalBytes;) {
+      const n = Math.min(PULL, totalBytes - off)
+      const r = await session.send('Runtime.evaluate', {
+        expression: `(()=>{const u=window.__i16u;let b='';const st=0x4000;const from=${off},len=${n};for(let i=from;i<from+len;i+=st)b+=btoa(String.fromCharCode.apply(null,u.subarray(i,Math.min(i+st,from+len))));return b})()`,
+        returnByValue: true,
+      })
+      const str = r.result && r.result.value
+      if (typeof str !== 'string') throw new Error('cdp pull failed at ' + off)
+      const dec = Buffer.from(str, 'base64')
+      pieces.push(dec)
+      off += dec.length
+    }
+    const pcm = Buffer.concat(pieces)
+    if (pcm.length !== totalBytes) throw new Error(`pcm length mismatch ${pcm.length} != ${totalBytes}`)
+    console.log('pulled ' + totalBytes + ' bytes raw pcm')
+
+    // RMS scan: locates the song span and the longest clean run (element swaps
+    // can concatenate overlapping partials + silence gaps).
+    const win = SR >> 1
+    let first = -1, lastS = -1
+    let seqStart = -1, longestStart = -1, longestLen = 0
+    for (let s = 0; s + win <= cap.samples; s += win) {
+      let acc = 0
+      const off = s * 2
+      for (let i = off; i < off + win * 2; i++) acc += pcm[i] * pcm[i]
+      const rmsdB = Math.max(-120, 20 * Math.log10(Math.sqrt(acc / (win * 2)) / 32767))
+      if (rmsdB > -48) {
+        if (first < 0) first = s
+        lastS = s + win
+        if (seqStart < 0) seqStart = s
+        if (s + win - seqStart > longestLen) { longestLen = s + win - seqStart; longestStart = seqStart }
+      } else {
+        seqStart = -1
+      }
+    }
+    if (first < 0) throw new Error('captured audio is all silence (RMS)')
+    const want = Math.round(cap.maxDur * SR)
+    // Prefer a clean uninterrupted play if it covers ~90% of the song.
+    let sliceStart, sliceEnd
+    if (longestLen >= want * 0.90) { sliceStart = longestStart; sliceEnd = longestStart + Math.min(longestLen, want) }
+    else {
+      sliceStart = first
+      sliceEnd = Math.min(lastS, first + want)
+    }
+    console.log(`RMS: first=${(first / SR).toFixed(1)}s lastS=${(lastS / SR).toFixed(1)}s longest=${(longestLen / SR).toFixed(1)}s slice=${(sliceStart / SR).toFixed(1)}..${(sliceEnd / SR).toFixed(1)}s (${((sliceEnd - sliceStart) / SR).toFixed(1)}s)`)
+    if (!(sliceEnd - sliceStart >= want * 0.90)) throw new Error(`trimmed audio too short: ${((sliceEnd - sliceStart) / SR).toFixed(1)}s vs ${(cap.maxDur).toFixed(1)}s`)
+
+    const stereoBytes = (sliceEnd - sliceStart) * 4
+    const data = Buffer.alloc(stereoBytes)
+    pcm.copy(data, 0, sliceStart * 4, sliceEnd * 4)
+
+    const h = Buffer.alloc(44)
+    h.write('RIFF', 0); h.writeUInt32LE(36 + stereoBytes, 4); h.write('WAVE', 8)
+    h.write('fmt ', 12); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(2, 22)
+    h.writeUInt32LE(SR, 24); h.writeUInt32LE(SR * 2 * 2, 28); h.writeUInt16LE(4, 32); h.writeUInt16LE(16, 34)
+    h.write('data', 36); h.writeUInt32LE(stereoBytes, 40)
+    const wavBuffer = Buffer.concat([h, data])
+
+    try {
+      await writeFile(join('/app/out', `master_${jobId}.wav`), wavBuffer)
+      console.log('master wav persisted to /app/out')
+    } catch (e) {
+      console.log('master wav not persisted:', e.message)
+    }
+
+    const MONO_RATE = 44100
+    const stereoNs = sliceEnd - sliceStart
+    const monoSamples = Math.round(stereoNs * MONO_RATE / SR)
+    const mono = Buffer.alloc(monoSamples * 2)
+    for (let o = 0; o < monoSamples; o++) {
+      const pos = o * (SR / MONO_RATE)
+      let i = pos | 0
+      if (i >= stereoNs - 1) i = stereoNs - 2
+      if (i < 0) i = 0
+      const f = pos - i
+      const j0 = i * 4, j1 = j0 + 4
+      const l0 = data.readInt16LE(j0), r0 = data.readInt16LE(j0 + 2)
+      const l1 = data.readInt16LE(j1), r1 = data.readInt16LE(j1 + 2)
+      const s = ((l0 * (1 - f) + l1 * f) + (r0 * (1 - f) + r1 * f)) / 2
+      mono.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(s))), o * 2)
+    }
+    const monoBytes = mono.length
+    const mh = Buffer.alloc(44)
+    mh.write('RIFF', 0); mh.writeUInt32LE(36 + monoBytes, 4); mh.write('WAVE', 8)
+    mh.write('fmt ', 12); mh.writeUInt32LE(16, 16); mh.writeUInt16LE(1, 20); mh.writeUInt16LE(1, 22)
+    mh.writeUInt32LE(MONO_RATE, 24); mh.writeUInt32LE(MONO_RATE * 2, 28); mh.writeUInt16LE(2, 32); mh.writeUInt16LE(16, 34)
+    mh.write('data', 36); mh.writeUInt32LE(monoBytes, 40)
+    const uploadWav = Buffer.concat([mh, mono])
+
+    const wavPath = `audio/raw/${jobId}.wav`
+    const { error } = await sb.storage.from('tracks').upload(wavPath, uploadWav, {
+      contentType: 'audio/wav',
+      upsert: true,
+    })
+    if (error) throw new Error(`Supabase Storage upload failed: ${error.message}`)
+    const { data: urlData } = sb.storage.from('tracks').getPublicUrl(wavPath)
+    console.log(`✅ WAV uploaded: ${urlData.publicUrl} (${(uploadWav.length / 1048576).toFixed(1)} MB, ${(monoSamples / MONO_RATE).toFixed(1)}s 44.1kHz mono)`)
+
+    // FLAC master → QNAP only, best effort (needs ffmpeg inside the container)
+    let flacPath = null
+    try {
+      const ff = await import('node:child_process')
+      ff.execSync('which ffmpeg', { stdio: 'ignore' })
+      const tmpWav = join(tmpdir(), `cap_${jobId}.wav`)
+      await writeFile(tmpWav, wavBuffer)
+      flacPath = join(QNAP_FLAC_BASE, artistName, 'flac', `flac_${jobId}.flac`)
+      ff.execSync(`ffmpeg -y -v error -i "${tmpWav}" -c:a flac -compression_level 8 "${flacPath}"`, { stdio: 'ignore' })
+      console.log(`FLAC master written to QNAP: ${flacPath}`)
+      await rm(tmpWav, { force: true })
+    } catch (e) {
+      console.error('FLAC master skipped (WAV only):', e.message)
+    }
+
+    return { audioUrl: urlData.publicUrl, flacPath }
   }
 
-return { audioUrl: data.publicUrl, flacPath }
+  // Self-retry: return to the URL and recapture up to 2 more times when the
+  // trimmed result is too short (per-element decoder stalls are run-specific).
+  let lastErr = null
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      if (attempt > 1) {
+        if (page.isClosed?.()) {
+          console.log(`[capture] page was closed, opening a new page for retry ${attempt}`)
+          page = await page.context().newPage()
+        }
+        await page.goto(`https://suno.com/song/${clipId}`, { waitUntil: 'domcontentloaded', timeout: 20000 })
+        await page.waitForTimeout(1500)
+        console.log(`[capture] retry ${attempt} on fresh page`)
+        const cp = doCapture()
+        let rtries = 0
+        for (let i = 0; i < 40; i++) {
+          const st = await page.evaluate(() => {
+            const a = [...document.querySelectorAll('audio')].find(x => !x.src.includes('sil-100') && isFinite(x.duration) && x.duration > 0)
+            return a ? { dur: a.duration, cur: a.currentTime, paused: a.paused } : null
+          }).catch(() => null)
+          if (st && st.cur >= 5) { console.log(`[gate] retry gate passed dur=${st.dur.toFixed(1)} cur=${st.cur.toFixed(1)}`); break }
+          if (Date.now() - lastClickAt > 25000) {
+            await clickPlay().catch(() => {})
+            lastClickAt = Date.now(); rtries++
+            console.log(`[gate] retry play click #${rtries}`)
+          }
+          await page.waitForTimeout(3000)
+        }
+        cap = await cp
+        console.log('CAPTURE retry done:', JSON.stringify(cap))
+      }
+      return await post()
+    } catch (e) {
+      lastErr = e
+      console.log(`[capture] attempt ${attempt} failed: ${e.message}`)
+    }
+  }
+  throw lastErr || new Error('capture failed after retries')
 }
-
-// ── Download audio via direct fetch (bypasses closed browser page) ──────
-// Uses the audio download URL captured from the response interceptor.
-// This works even when the Playwright page has closed.
 async function fetchAudio(audioDownloadUrl, clipId, jobId, artistName) {
   const response = await fetch(audioDownloadUrl)
   if (!response.ok) throw new Error(`Fetch failed: ${response.status}`)
   const buffer = Buffer.from(await response.arrayBuffer())
+  // Suno encrypts rail at rest; CDN bytes are AES256 ciphertext (no ISO-BMFF
+  // 'ftyp' magic). Only accept a real MP4/M4A here — anything else would be
+  // uploaded as a corrupt ".wav". Garbage → throw, caller falls back to capture.
+  if (buffer.length < 12 || buffer.slice(4, 8).toString() !== 'ftyp') {
+    throw new Error(`CDN response is not a decodable file (${buffer.length} bytes, magic='${buffer.slice(4, 8).toString()}')`)
+  }
   // End-user format: WAV only (Supabase storage)
   const wavPath = `audio/raw/${jobId}.wav`
   const { error } = await sb.storage.from('tracks').upload(wavPath, buffer, {
@@ -325,13 +574,18 @@ async function generateSong(prompt, style, jobId, title, artistName) {
   )
 
 const page = browser.pages()[0] || await browser.newPage()
-  page.on('console', m => { if (/\[TB\]|turnstile|captcha|600010/i.test(m.text())) console.log('[PAGE]', m.text().slice(0, 150)) })
+  page.on('console', m => { if (/\[TB\]|turnstile|captcha|600010|\[capture\]/i.test(m.text())) console.log('[PAGE]', m.text().slice(0, 200)) })
 
-  try {
+  // Shared job state: declared at function scope because they are read in the
+  // final `return` AFTER the try/catch/finally block (block-scoped let inside
+  // the try would be a ReferenceError there).
   let clipId = null
   let flacUrl = null
   let audioUrl = null
+  let flacPath = null
   let audioDownloadUrl = null
+
+  try {
   let domDataAtClose = null
   let beforeSongIds = new Set()
   const rejectedClipIds = new Set()
@@ -902,11 +1156,11 @@ const page = browser.pages()[0] || await browser.newPage()
     // (Suno Service Worker). Switched to DOM-based songIdsOnPage() — the fake
     // generate/v2-web/ response triggers React to render a new <a href="/song/<id>">
     // link, which page.evaluate() querySelector picks up reliably.
-    console.log('Waiting for generation (up to 5 min) — polling /song/<uuid> links for new song...')
+    console.log('Waiting for generation (up to 20 min) — polling /song/<uuid> links for new song...')
     let waitLoopErrors = 0
     let feedBaseline = null
     let filtersCleared = false
-    const deadline = Date.now() + 720000
+    const deadline = Date.now() + 1200000
     while (!clipId && Date.now() < deadline) {
       try {
         // If the page/browser closed mid-generation, break to recovery
@@ -1122,7 +1376,30 @@ async function main() {
     return
   }
 
+  // A prior run's watchdog timeout (below) force-exits this process but can
+  // leave its Chromium orphaned, holding a profile-dir lock — sweep any
+  // leftover instance before touching the queue (safe: systemd timer runs
+  // this oneshot, non-overlapping, so anything matching here is guaranteed
+  // stale from a run that already ended).
+  try {
+    execSync(`pkill -9 -f "suno_profile_"`, { stdio: 'ignore' })
+    execSync(`pkill -9 -f "${CHROME_PROFILE}"`, { stdio: 'ignore' })
+  } catch {}
+
   console.log(`[${new Date().toISOString()}] Suno worker checking queue...`)
+
+  // Reap jobs stuck in 'processing' from a run that died mid-job (crash,
+  // kill -9, host reboot — none of which the per-job watchdog below can
+  // catch, since that only protects a still-running process). systemd runs
+  // one instance at a time, so any 'processing' row found here is guaranteed
+  // stale, not a job actively being worked by a concurrent run.
+  const { data: stuck } = await sb
+    .from('generation_jobs')
+    .update({ status: 'failed', error: 'Suno worker: process died mid-job (reaped on next run)' })
+    .eq('status', 'processing')
+    .like('replicate_prediction_id', 'suno_pending_%')
+    .select('id')
+  if (stuck?.length) console.log(`Reaped ${stuck.length} stuck 'processing' job(s)`)
 
   const { data: jobs } = await sb
     .from('generation_jobs')
@@ -1189,7 +1466,17 @@ async function main() {
 
     try {
       const artistName = artist?.name?.replace(/[^a-zA-Z0-9]/g, '_') || 'UNKNOWN_ARTIST'
-      const result = await generateSong(prompt, style, job.id, job.title, artistName)
+      // Watchdog: generateSong() has no internal timeout on browser launch/nav
+      // steps outside its own try block — a hang there blocks main() forever
+      // and the process never exits. Sized above the 20min generation-wait
+      // deadline plus headroom for the capture pipeline's own 3-attempt retry
+      // (each with its own freeze watchdog), so it only fires on a genuine
+      // top-level hang, not a slow-but-alive job.
+      const result = await Promise.race([
+        generateSong(prompt, style, job.id, job.title, artistName),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Job watchdog: generateSong exceeded 35min')), 35 * 60 * 1000)),
+      ])
       const clipId = result?.clipId
       const audioUrl = result?.audioUrl
 
@@ -1236,6 +1523,86 @@ async function main() {
   }
 
   console.log('\nDone.')
+}
+
+// ── Capture-mode: capture an ALREADY-GENERATED clip for a real job ───────────
+if (process.argv.includes('--capturejob')) {
+  const idx = process.argv.indexOf('--capturejob')
+  const jobId = process.argv[idx + 1]
+  const clip = process.argv[idx + 2]
+  if (!jobId || !clip) { console.error('usage: --capturejob <jobId> <clipId>'); process.exit(2) }
+  const { data: job } = await sb
+    .from('generation_jobs')
+    .select('title,artists(name)')
+    .eq('id', jobId)
+    .maybeSingle()
+  if (!job) { console.error('job not found'); process.exit(2) }
+  const artistName = job.artists?.name?.replace(/[^a-zA-Z0-9]/g, '_') || 'UNKNOWN_ARTIST'
+  // claim it first so the remote worker doesn't steal/fail it mid-capture
+  const { data: claimed } = await sb
+    .from('generation_jobs')
+    .update({ status: 'processing' })
+    .eq('id', jobId)
+    .eq('status', 'pending')
+    .select()
+    .maybeSingle()
+  if (!claimed) {
+    const st = await sb.from('generation_jobs').select('status').eq('id', jobId).maybeSingle()
+    console.log(`Job ${jobId} not claimable (status=${st?.data?.status})`)
+    if (st?.data?.status === 'failed') {
+      const { data: reclaimed } = await sb.from('generation_jobs').update({ status: 'processing' }).eq('id', jobId).select().maybeSingle()
+      if (reclaimed) console.log('Reclaimed from failed')
+      else { console.error('still not claimable'); process.exit(3) }
+    } else process.exit(3)
+  }
+  console.log(`[capturejob] ${job.title} (${artistName}) clip=${clip}`)
+  const browser = await chromium.launchPersistentContext(
+    CHROME_PROFILE,
+    { executablePath: CHROME_BIN, headless: false,
+      args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--profile-directory=Default', '--disable-gpu', '--disable-setuid-sandbox', '--disable-extensions', '--no-zygote'],
+      viewport: { width: 1280, height: 900 }, acceptDownloads: true })
+  const page = browser.pages()[0] || await browser.newPage()
+  try {
+    const res = await downloadRealAudio(page, clip, jobId, job.title, artistName)
+    console.log('CAPTUREJOB RESULT:', JSON.stringify(res))
+    const { error: uerr } = await sb.from('generation_jobs').update({
+      status: 'pending',
+      replicate_prediction_id: `suno_${clip}`,
+      audio_url: res.audioUrl,
+      error: null,
+    }).eq('id', jobId)
+    if (uerr) console.error('DB update failed:', uerr.message)
+    else console.log(`✅ Job ${jobId} updated → suno_${clip}\n   Audio: ${res.audioUrl}`)
+  } catch (e) {
+    console.error('CAPTUREJOB FAILED:', e.message)
+    await sb.from('generation_jobs').update({
+      status: 'failed',
+      error: `capture job: ${e.message}`,
+    }).eq('id', jobId).then(({ error: uerr }) => uerr && console.error('DB failed-mark failed:', uerr.message)).catch(() => {})
+    process.exit(1)
+  } finally {
+    await browser.close()
+  }
+  process.exit(0)
+}
+
+// ── Test capture mode (validates downloadRealAudio against an existing clip) ─
+if (process.argv.includes('--testcapture')) {
+  const clip = process.argv[process.argv.indexOf('--testcapture') + 1]
+  if (!clip) { console.error('usage: --testcapture <clipId>'); process.exit(2) }
+  const browser = await chromium.launchPersistentContext(
+    CHROME_PROFILE,
+    { executablePath: CHROME_BIN, headless: false,
+      args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--profile-directory=Default', '--disable-gpu', '--disable-setuid-sandbox', '--disable-extensions', '--no-zygote'],
+      viewport: { width: 1280, height: 900 }, acceptDownloads: true })
+  const page = browser.pages()[0] || await browser.newPage()
+  try {
+    const res = await downloadRealAudio(page, clip, 'testjob', 'Test Song', 'TEST_ARTIST')
+    console.log('TESTCAPTURE RESULT:', JSON.stringify(res))
+  } finally {
+    await browser.close()
+  }
+  process.exit(0)
 }
 
 main()
