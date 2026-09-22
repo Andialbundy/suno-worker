@@ -43,7 +43,7 @@ Siehe [`ARCHITECTURE.md`](ARCHITECTURE.md) — vollständige Pipeline (Vercel Cr
 | `test/set-artist-templates.test.mjs` | ✅ passing |
 | `test/gencover.test.mjs` | ❌ pre-existing: needs SVG brand assets + render-cover-hud |
 | `test/regen-covers.test.mjs` | ❌ pre-existing: needs SVG brand assets + render-cover-hud |
-| `test/harvest-flac.test.mjs` | ❌ pre-existing: harvest-flac.mjs missing MERGE_SCRIPT export |
+| `test/harvest-flac.test.mjs` | ✅ **6/6** (transcode, FLAC conversion, harvest, MERGE_SCRIPT, computeTrim) |
 
 ## Deployment (Produktiv)
 
