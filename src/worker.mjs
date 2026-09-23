@@ -1447,7 +1447,7 @@ async function main() {
       continue
     }
 
-    // Atomic claim: only the worker instance that flips pending -> processing
+    // Atomic claim: only the worker instance that flips the job's current status (pending or failed) -> processing
     // proceeds. Prevents two workers (e.g. Mac + neuralnode running in
     // parallel during migration) from double-generating the same job — same
     // pattern already used in /api/agent/music/poll (commit a58ee7d).
@@ -1455,7 +1455,7 @@ async function main() {
       .from('generation_jobs')
       .update({ status: 'processing' })
       .eq('id', job.id)
-      .eq('status', 'pending')
+      .eq('status', job.status)
       .select()
       .maybeSingle()
 
